@@ -1,0 +1,26 @@
+# FastAPI & Server
+fastapi
+uvicorn
+python-multipart
+pydantic
+
+# Database
+sqlalchemy
+psycopg2-binary
+
+# LangChain Ecosystem (Tương thích với nhau)
+langchain
+langchain-core
+langchain-community
+langchain-classic
+langchain-experimental
+langchain-google-genai
+langchain-chroma
+
+# Document Parsers
+pypdf
+pymupdf
+pdfplumber
+docx2txt
+unstructured
+openpyxl

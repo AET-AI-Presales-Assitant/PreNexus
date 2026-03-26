@@ -1,0 +1,5 @@
+{
+  "name": "AI-powered Presales Assistant",
+  "description": "Retrieve, reason over, and synthesize internal knowledge to support real presales workflows with a knowledge base.",
+  "requestFramePermissions": []
+}

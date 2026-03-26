@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: enterprise-rag-db
+    restart: always
+    environment:
+      POSTGRES_USER: enterprise_user
+      POSTGRES_PASSWORD: enterprise_password
+      POSTGRES_DB: enterprise_rag
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
