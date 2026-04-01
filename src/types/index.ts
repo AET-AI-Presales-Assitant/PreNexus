@@ -20,7 +20,29 @@ export interface Message {
   sessionId: string;
   role: 'user' | 'agent';
   content: string;
+  citations?: Citation[];
+  usedDocs?: UsedDoc[];
+  thoughts?: { step: string; details: string; status: string }[];
   createdAt: number;
+}
+
+export interface Citation {
+  id: string;
+  title: string;
+  source: string;
+  category: string;
+  role: string;
+  score?: number;
+  page?: number | null;
+  snippet: string;
+}
+
+export interface UsedDoc {
+  id: string;
+  title: string;
+  content: string;
+  score?: number;
+  metadata?: { source?: string; category?: string; role?: string };
 }
 
 export interface AnalyticsQuery {

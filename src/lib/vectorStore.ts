@@ -20,6 +20,7 @@ export interface Document {
   role: Role;
   topic?: KnowledgeType | string;
   embedding?: number[];
+  createdAt?: number;
 }
 
 export async function getEmbedding(text: string, ai: GoogleGenerativeAI): Promise<number[]> {

@@ -1,9 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { GoogleGenerativeAI } from "@google/generative-ai";
 
-import { Role, Document, getEmbedding } from './lib/vectorStore';
-import { RAGAgent, AgentTrace, analyzeDocument } from './lib/agent';
+import { Role, Document } from './lib/vectorStore';
 import { User, Message } from './types';
 import { useSessions, useAdminUsers, useAdminAnalytics } from './hooks/useApi';
 
@@ -16,10 +14,6 @@ import { ImportData } from './components/admin/ImportData';
 
 import { KnowledgeBase } from './components/KnowledgeBase';
 
-const API_KEY = process.env.GEMINI_API_KEY || '';
-const ai = new GoogleGenerativeAI(API_KEY);
-const agent = new RAGAgent(API_KEY);
-
 const queryClient = new QueryClient();
 
 function AppContent() {
@@ -31,7 +25,6 @@ function AppContent() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [latestThought, setLatestThought] = useState<AgentTrace | null>(null);
 
   const [authMode, setAuthMode] = useState<'select' | 'login' | 'register'>('select');
   const [authForm, setAuthForm] = useState({ username: '', password: '', name: '' });
@@ -110,7 +103,6 @@ function AppContent() {
       if (data.success) {
         refetchSessions();
         setCurrentSessionId(data.session.id);
-        setLatestThought(null);
         return data.session.id;
       }
     } catch (e) {
@@ -156,7 +148,6 @@ function AppContent() {
       if (data.success) {
         setMessages(data.messages);
         setCurrentSessionId(sessionId);
-        setLatestThought(null);
         setActiveAdminTab(null);
       }
     } catch (e) {
@@ -170,39 +161,14 @@ function AppContent() {
   };
 
   const handleAnalyzeGaps = async (queries: string[]) => {
-    const prompt = `
-      You are an AI analyst for a Presales Knowledge Base. Analyze the following user queries to provide insights for the admin.
-
-      USER QUERIES:
-      ${queries.slice(0, 100).join('\n')}
-
-      REQUIREMENTS:
-      Return the result STRICTLY as a JSON object matching this structure:
-      {
-        "topInterests": [
-          {
-            "topic": "string (e.g., Technical capabilities, case studies)",
-            "reason": "string (Why presales team is asking about this)"
-          }
-        ],
-        "knowledgeGaps": [
-          {
-            "question": "string (The specific question or topic missing)",
-            "suggestion": "string (Actionable advice for the admin to add document)"
-          }
-        ]
-      }
-
-      Limit topInterests to 3 items, and knowledgeGaps to 2-3 items. No markdown, only JSON.
-    `;
-    const model = ai.getGenerativeModel({ 
-      model: process.env.GEMINI_MODEL || 'gemini-1.5-flash',
-      generationConfig: {
-        responseMimeType: 'application/json'
-      }
+    const response = await fetch('http://localhost:3005/api/admin/analyze_gaps', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ queries })
     });
-    const response = await model.generateContent(prompt);
-    return response.response.text();
+    const data = await response.json();
+    if (data.success) return data.result;
+    return null;
   };
 
   const handleAuth = async (e: React.FormEvent) => {
@@ -230,7 +196,7 @@ function AppContent() {
           setIsLoggedIn(true);
           
           if (data.user.role === 'Admin') {
-            setActiveAdminTab('analytics');
+            setActiveAdminTab('knowledge');
           } else {
             setActiveAdminTab(null);
           }
@@ -259,6 +225,10 @@ function AppContent() {
       sessionId = await createNewSession(query.substring(0, 30) + '...');
     }
 
+    const agentMsgId = (Date.now() + 1).toString();
+    const tempAgentMsg: Message = { id: agentMsgId, sessionId: sessionId || '', role: 'agent', content: '', citations: [], thoughts: [], createdAt: Date.now() };
+    setMessages(prev => [...prev, tempAgentMsg]);
+
     try {
       if (sessionId) {
         await fetch('http://localhost:3005/api/messages', {
@@ -268,19 +238,122 @@ function AppContent() {
         });
       }
 
-      const answer = await agent.execute(query, documents, userRole, (trace) => setLatestThought(trace), [...messages, tempUserMsg]);
+      const chatRes = await fetch('http://localhost:3005/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: query,
+          userId: currentUser?.id || null,
+          userRole,
+          sessionId: sessionId || null,
+          topK: 4,
+          history: [...messages, tempUserMsg].map(m => ({ role: m.role, content: m.content }))
+        })
+      });
 
-      if (sessionId) {
-        await fetch('http://localhost:3005/api/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId, role: 'agent', content: answer })
-        });
+      if (!chatRes.body) throw new Error('No response body');
+
+      const reader = chatRes.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      let buffer = '';
+      let bufferedText = '';
+      let allowAnswer = false;
+      const stepOrder = ['Decomposition', 'Delegation', 'Critique', 'Synthesis'];
+      const stepStatus: Record<string, string> = {};
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // keep the incomplete line in buffer
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const dataStr = line.substring(6);
+              if (!dataStr.trim()) continue;
+              try {
+                const data = JSON.parse(dataStr);
+                if (data.type === 'trace') {
+                  const newThought = {
+                    step: data.step,
+                    details: data.details,
+                    status: data.status
+                  };
+                  if (newThought.step && typeof newThought.status === 'string') {
+                    stepStatus[newThought.step] = newThought.status;
+                    const ok = stepOrder.every(s => stepStatus[s] === 'success');
+                    if (ok && !allowAnswer) {
+                      allowAnswer = true;
+                      if (bufferedText) {
+                        const toFlush = bufferedText;
+                        bufferedText = '';
+                        setMessages(prev => prev.map(msg => 
+                          msg.id === agentMsgId ? { ...msg, content: msg.content + toFlush } : msg
+                        ));
+                      }
+                    }
+                  }
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === agentMsgId
+                      ? {
+                          ...msg,
+                          thoughts: (() => {
+                            const current = Array.isArray(msg.thoughts) ? msg.thoughts : [];
+                            const idx = current.findIndex(t => t && t.step === newThought.step);
+                            if (idx >= 0) {
+                              const next = current.slice();
+                              next[idx] = newThought;
+                              return next;
+                            }
+                            return [...current, newThought];
+                          })()
+                        }
+                      : msg
+                  ));
+                } else if (data.type === 'chunk') {
+                  if (!allowAnswer) {
+                    bufferedText += (data.content || '');
+                  } else {
+                    setMessages(prev => prev.map(msg => 
+                      msg.id === agentMsgId ? { ...msg, content: msg.content + data.content } : msg
+                    ));
+                  }
+                } else if (data.type === 'clear') {
+                  bufferedText = '';
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === agentMsgId ? { ...msg, content: '' } : msg
+                  ));
+                } else if (data.type === 'done') {
+                  if (!allowAnswer && bufferedText) {
+                    const toFlush = bufferedText;
+                    bufferedText = '';
+                    allowAnswer = true;
+                    setMessages(prev => prev.map(msg => 
+                      msg.id === agentMsgId ? { ...msg, content: msg.content + toFlush } : msg
+                    ));
+                  }
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === agentMsgId ? { ...msg, citations: data.citations || [], usedDocs: data.used_docs || [] } : msg
+                  ));
+                } else if (data.type === 'error') {
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === agentMsgId ? { ...msg, content: msg.content + '\n\n[Error: ' + data.message + ']' } : msg
+                  ));
+                }
+              } catch (err) {
+                console.error('Error parsing SSE data:', err);
+              }
+            }
+          }
+        }
       }
-      const tempAgentMsg: Message = { id: (Date.now() + 1).toString(), sessionId: sessionId || '', role: 'agent', content: answer, createdAt: Date.now() };
-      setMessages(prev => [...prev, tempAgentMsg]);
     } catch (error) {
-      setMessages(prev => [...prev, { id: 'err', sessionId: '', role: 'agent', content: 'Error processing request.', createdAt: Date.now() }]);
+      setMessages(prev => prev.map(msg => 
+        msg.id === agentMsgId ? { ...msg, content: 'Error processing request.' } : msg
+      ));
     } finally {
       setIsProcessing(false);
     }
@@ -344,7 +417,6 @@ function AppContent() {
         onNewConversation={() => { 
           setMessages([]); 
           setCurrentSessionId(null); 
-          setLatestThought(null); 
           setActiveAdminTab(null);
           if (window.innerWidth <= 1024) setIsSidebarOpen(false);
         }}
@@ -399,7 +471,6 @@ function AppContent() {
           onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
           messages={messages}
           isProcessing={isProcessing}
-          latestThought={latestThought}
           input={input}
           onInputChange={setInput}
           onSendMessage={handleSendMessage}

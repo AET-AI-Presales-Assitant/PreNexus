@@ -70,10 +70,6 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
     return acc;
   }, {} as Record<string, Document[]>);
 
-  const displayTypes = selectedType 
-    ? KNOWLEDGE_TYPES.filter(t => t.id === selectedType)
-    : KNOWLEDGE_TYPES; // Show all sections, even if empty, as requested "không cần chia theo nhóm, vì đã có filter ở trên", but let's keep the filter UI and just show a flat list if preferred, or keep sections. Actually, the prompt says "không cần chia theo nhóm". Let's flat map the documents.
-
   // Flat list of documents instead of grouped sections
   const displayDocs = selectedType 
     ? accessibleDocs.filter(doc => (doc.topic === selectedType) || (!KNOWLEDGE_TYPES.find(t=>t.id===doc.topic) && selectedType === 'General'))
@@ -113,7 +109,7 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
 
   // Helper to format date
   const formatDate = (timestamp?: number) => {
-    if (!timestamp) return 'Mar 24, 2026'; // Mock date for parity
+    if (!timestamp) return '—';
     return new Date(timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
   };
 
@@ -259,7 +255,7 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
                   {/* Footer - Date */}
                   <div className="pt-4 border-t border-neutral-100 flex items-center text-neutral-400 text-xs mt-auto">
                     <Calendar className="w-3.5 h-3.5 mr-1.5" />
-                    {formatDate()}
+                    {formatDate(doc.createdAt)}
                   </div>
                 </div>
               )})}
