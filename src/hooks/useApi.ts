@@ -1,14 +1,14 @@
 import { useQuery } from '@tanstack/react-query';
 import { Session, User, AnalyticsQuery } from '../types';
 
-const BASE_URL = 'http://localhost:3005/api';
+import { apiUrl } from '../lib/api';
 
 export const useSessions = (userId: string | undefined) => {
   return useQuery({
     queryKey: ['sessions', userId],
     queryFn: async () => {
       if (!userId) return [];
-      const response = await fetch(`${BASE_URL}/sessions?userId=${userId}`);
+      const response = await fetch(apiUrl(`/sessions?userId=${userId}`));
       const data = await response.json();
       return data.sessions as Session[];
     },
@@ -21,7 +21,7 @@ export const useSessionMessages = (sessionId: string | null) => {
     queryKey: ['messages', sessionId],
     queryFn: async () => {
       if (!sessionId) return [];
-      const response = await fetch(`${BASE_URL}/sessions/${sessionId}/messages`);
+      const response = await fetch(apiUrl(`/sessions/${sessionId}/messages`));
       const data = await response.json();
       return data.messages;
     },
@@ -33,7 +33,7 @@ export const useAdminUsers = (isAdmin: boolean) => {
   return useQuery({
     queryKey: ['admin', 'users'],
     queryFn: async () => {
-      const response = await fetch(`${BASE_URL}/admin/users`);
+      const response = await fetch(apiUrl(`/admin/users`));
       const data = await response.json();
       return data.users as User[];
     },
@@ -45,7 +45,7 @@ export const useAdminAnalytics = (isAdmin: boolean) => {
   return useQuery({
     queryKey: ['admin', 'analytics'],
     queryFn: async () => {
-      const response = await fetch(`${BASE_URL}/admin/analytics`);
+      const response = await fetch(apiUrl(`/admin/analytics`));
       const data = await response.json();
       return data.queries as AnalyticsQuery[];
     },

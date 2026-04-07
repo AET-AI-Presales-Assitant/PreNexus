@@ -1,11 +1,36 @@
 import { motion } from 'motion/react';
-import { User, Bot, Loader2, Send, Menu, ChevronDown, ChevronRight, CheckCircle2, AlertCircle, CircleDashed, Info } from 'lucide-react';
+import { User, Bot, Loader2, Send, Menu, ChevronDown, ChevronRight, CheckCircle2, AlertCircle, CircleDashed, Info, ExternalLink } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Message } from '../types';
 import { Role } from '../lib/vectorStore';
+import { apiUrl } from '../lib/api';
 import { useEffect, useRef, FormEvent, useState } from 'react';
 import { Dialog, DialogContent } from './ui/dialog';
+
+const STARTER_QUESTIONS_POOL = [
+  'Find a case study for financial services',
+  'What are our SLA capabilities?',
+  'Generate a standard security checklist',
+  'How do we handle data migrations?',
+  'Draft an RFP response outline for a fintech client',
+  'Summarize our strengths for React + FastAPI projects',
+  'What are our recommended discovery questions for a new client?',
+  'Create a project plan for an MVP in 6 weeks',
+  'What integrations do we commonly support? (CRM, ERP, payment...)',
+  'Propose an architecture for an enterprise knowledge chatbot (RAG)'
+];
+
+function pickRandomUnique<T>(arr: T[], count: number): T[] {
+  const a = Array.isArray(arr) ? arr.slice() : [];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = a[i];
+    a[i] = a[j];
+    a[j] = t;
+  }
+  return a.slice(0, Math.max(0, Math.min(count, a.length)));
+}
 
 function renderWithParenthesisItalics(text: string) {
   const nodes: any[] = [];
@@ -65,58 +90,64 @@ function AgentMessageContent({ content }: { content: string }) {
 
 function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any[] }) {
   const [open, setOpen] = useState(false);
-  const [selected, setSelected] = useState<any | null>(null);
-  const docsById = new Map<string, any>();
-  for (const d of (usedDocs || [])) {
-    if (d && d.id) docsById.set(String(d.id), d);
-  }
+  const [selectedFile, setSelectedFile] = useState<string>('');
 
   if (!Array.isArray(citations) || citations.length === 0) return null;
 
-  const selectedDoc = selected ? docsById.get(String(selected.id)) : null;
-  const metaSource = selectedDoc?.metadata?.source || selected?.source;
-  const metaCategory = selectedDoc?.metadata?.category || selected?.category;
-  const metaRole = selectedDoc?.metadata?.role || selected?.role;
-  const content = selectedDoc?.content;
-
-  const getTags = (text: string) => {
-    const tags = (text || '').match(/#\w+/g) || [];
-    return tags.slice(0, 8);
+  const fileNameFrom = (v: any) => {
+    const s = String(v || '');
+    if (!s) return '';
+    const parts = s.split(/[\\/]/g);
+    return parts[parts.length - 1] || s;
   };
 
-  const badgeClass = (category: string) => {
-    const c = (category || '').toLowerCase();
-    if (c.includes('skills') || c.includes('tech')) return 'bg-blue-50 text-blue-600 border border-blue-100';
-    if (c.includes('case')) return 'bg-emerald-50 text-emerald-600 border border-emerald-100';
-    if (c.includes('presales') || c.includes('proposal')) return 'bg-purple-50 text-purple-600 border border-purple-100';
-    if (c.includes('checklist')) return 'bg-blue-50 text-blue-600 border border-blue-100';
-    if (c.includes('know')) return 'bg-purple-50 text-purple-600 border border-purple-100';
-    return 'bg-slate-50 text-slate-600 border border-slate-100';
+  const sourceById = new Map<string, string>();
+  for (const d of (usedDocs || [])) {
+    const id = d && d.id ? String(d.id) : '';
+    const src = d?.metadata?.source ? fileNameFrom(d.metadata.source) : '';
+    if (id && src) sourceById.set(id, src);
+  }
+
+  const grouped = new Map<string, any[]>();
+  for (const c of citations) {
+    const fid = String(c?.id || '');
+    const src = fileNameFrom(c?.source) || (fid ? (sourceById.get(fid) || '') : '');
+    if (!src) continue;
+    const list = grouped.get(src) || [];
+    list.push(c);
+    grouped.set(src, list);
+  }
+
+  const allFiles = Array.from(grouped.keys());
+  const pdfFiles = allFiles.filter(f => f.toLowerCase().endsWith('.pdf'));
+  const filesToShow = pdfFiles.length > 0 ? pdfFiles : allFiles;
+
+  const openPdf = (fileName: string) => {
+    const url = apiUrl(`/files/${encodeURIComponent(fileName)}`);
+    window.open(url, '_blank', 'noopener,noreferrer');
   };
 
-  const viewTitle = selected?.title || selected?.source || 'Document';
-  const viewCategory = metaCategory || 'General';
-  const viewContent = content || selected?.snippet || '';
-  const tags = getTags(viewContent);
+  const selectedCitations = selectedFile ? (grouped.get(selectedFile) || []) : [];
 
   return (
     <div className="mt-4">
       <div className="text-[11px] font-bold text-neutral-500 tracking-wider uppercase mb-2">Knowledge sources used</div>
       <div className="space-y-2">
-        {citations.map((c, idx) => (
-          <div key={`${c.id}-${idx}`} className="flex items-center gap-3 bg-white/60 border border-neutral-200 rounded-xl px-3 py-2">
+        {filesToShow.map((f) => (
+          <div key={f} className="flex items-center gap-3 bg-white/60 border border-neutral-200 rounded-xl px-3 py-2">
             <div className="shrink-0 w-7 h-7 rounded-full bg-indigo-50 flex items-center justify-center">
               <Info className="w-4 h-4 text-indigo-500" />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-sm font-semibold text-neutral-900 truncate">{c.title || c.source || 'Document'}</div>
+              <div className="text-sm font-semibold text-neutral-900 truncate">{f}</div>
             </div>
-            {c.category ? (
-              <div className="shrink-0 text-[11px] font-bold text-neutral-700 bg-neutral-100 border border-neutral-200 rounded-full px-2 py-0.5">
-                {c.category}
-              </div>
+            {f.toLowerCase().endsWith('.pdf') ? (
+              <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => openPdf(f)}>
+                <ExternalLink className="w-3.5 h-3.5 mr-1" />
+                Open
+              </Button>
             ) : null}
-            <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => { setSelected(c); setOpen(true); }}>
+            <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => { setSelectedFile(f); setOpen(true); }}>
               View
             </Button>
           </div>
@@ -126,42 +157,32 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="bg-white rounded-2xl w-full max-w-3xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden p-0">
           <div className="flex items-center justify-between p-6 border-b border-neutral-100">
-            <span className={`text-[11px] px-3 py-1 rounded-full font-medium ${badgeClass(viewCategory)}`}>
-              {viewCategory}
-            </span>
+            <div className="text-lg font-semibold text-neutral-900 truncate">{selectedFile || 'Source'}</div>
+            {selectedFile && selectedFile.toLowerCase().endsWith('.pdf') ? (
+              <Button variant="outline" size="sm" className="h-9" onClick={() => openPdf(selectedFile)}>
+                <ExternalLink className="w-4 h-4 mr-2" />
+                Open PDF
+              </Button>
+            ) : null}
           </div>
 
-          <div className="p-8 overflow-y-auto flex-1">
-            <h2 className="text-2xl font-bold text-neutral-900 mb-4">{viewTitle}</h2>
-
-            {(tags.length > 0 || metaSource || metaRole || typeof selected?.page === 'number') ? (
-              <div className="flex flex-wrap gap-2 mb-8">
-                {tags.map((tag, i) => (
-                  <span key={i} className="text-[12px] bg-neutral-100 text-neutral-600 px-2 py-1 rounded-md">
-                    {tag}
-                  </span>
-                ))}
-                {metaSource ? (
-                  <span className="text-[12px] bg-neutral-50 text-neutral-600 px-2 py-1 rounded-md border border-neutral-100">
-                    {metaSource}
-                  </span>
-                ) : null}
-                {metaRole ? (
-                  <span className="text-[12px] bg-neutral-50 text-neutral-600 px-2 py-1 rounded-md border border-neutral-100">
-                    {metaRole}
-                  </span>
-                ) : null}
-                {typeof selected?.page === 'number' ? (
-                  <span className="text-[12px] bg-neutral-50 text-neutral-600 px-2 py-1 rounded-md border border-neutral-100">
-                    page {selected.page}
-                  </span>
-                ) : null}
-              </div>
-            ) : null}
-
-            <div className="prose prose-sm md:prose-base max-w-none text-neutral-600 whitespace-pre-wrap">
-              {viewContent}
-            </div>
+          <div className="p-8 overflow-y-auto flex-1 space-y-3">
+            {selectedCitations.length === 0 ? (
+              <div className="text-sm text-neutral-500">No details.</div>
+            ) : (
+              selectedCitations.slice(0, 8).map((c, idx) => (
+                <div key={`${c.id}-${idx}`} className="rounded-lg border border-neutral-200 p-3">
+                  <div className="text-sm font-semibold text-neutral-900">
+                    {c.title || 'Snippet'}
+                  </div>
+                  {c.snippet ? (
+                    <div className="text-xs text-neutral-700 mt-2 whitespace-pre-wrap leading-relaxed">
+                      {c.snippet}
+                    </div>
+                  ) : null}
+                </div>
+              ))
+            )}
           </div>
         </DialogContent>
       </Dialog>
@@ -211,6 +232,7 @@ interface ChatAreaProps {
   input: string;
   onInputChange: (value: string) => void;
   onSendMessage: (e: FormEvent) => void;
+  onSendText: (text: string) => void;
   userRole: Role;
   sessionTitle?: string;
 }
@@ -223,10 +245,12 @@ export function ChatArea({
   input,
   onInputChange,
   onSendMessage,
+  onSendText,
   userRole,
   sessionTitle
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [starterQuestions, setStarterQuestions] = useState<string[]>([]);
   const lastAgentIndex = (() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i]?.role === 'agent') return i;
@@ -234,9 +258,25 @@ export function ChatArea({
     return -1;
   })();
 
+  const shouldHideSourcesForMessage = (content: string) => {
+    const t = (content || '').toLowerCase();
+    if (!t) return false;
+    return (
+      t.includes('không có dữ liệu nội bộ') ||
+      t.includes('khong co du lieu noi bo') ||
+      t.includes('no internal data') ||
+      t.includes('missing internal data')
+    );
+  };
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isProcessing]);
+
+  useEffect(() => {
+    if (messages.length !== 0) return;
+    setStarterQuestions(pickRandomUnique(STARTER_QUESTIONS_POOL, 4));
+  }, [messages.length]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 bg-white relative">
@@ -257,7 +297,6 @@ export function ChatArea({
         </div>
         
         <div className="w-1/4 flex justify-end">
-          {/* Spacer for centering */}
         </div>
       </header>
 
@@ -271,6 +310,22 @@ export function ChatArea({
             <p className="text-sm text-neutral-500 leading-relaxed">
               Ask me about past case studies, technical capabilities, or generate an RFP response using our internal knowledge base.
             </p>
+            {starterQuestions.length > 0 ? (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-8 w-full">
+                {starterQuestions.map((q) => (
+                  <Button
+                    key={q}
+                    type="button"
+                    variant="outline"
+                    disabled={isProcessing}
+                    className="h-auto py-4 px-4 justify-start text-left whitespace-normal rounded-xl border-neutral-200 bg-white hover:bg-neutral-50 shadow-sm"
+                    onClick={() => onSendText(q)}
+                  >
+                    {q}
+                  </Button>
+                ))}
+              </div>
+            ) : null}
           </div>
         ) : (
           <div className="max-w-4xl mx-auto space-y-6">
@@ -308,7 +363,7 @@ export function ChatArea({
                       ? <AgentMessageContent content={msg.content} />
                       : <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
                     )}
-                    {msg.role === 'agent' && Array.isArray(msg.citations) && msg.citations.length > 0 && (
+                    {msg.role === 'agent' && !shouldHideSourcesForMessage(msg.content || '') && Array.isArray(msg.citations) && msg.citations.length > 0 && (
                       <SourcesUsed citations={msg.citations} usedDocs={msg.usedDocs} />
                     )}
                   </div>

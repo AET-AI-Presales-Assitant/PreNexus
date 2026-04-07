@@ -2,15 +2,45 @@ services:
   db:
     image: postgres:16-alpine
     container_name: enterprise-rag-db
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: enterprise_user
       POSTGRES_PASSWORD: enterprise_password
       POSTGRES_DB: enterprise_rag
-    ports:
-      - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enterprise_user -d enterprise_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: enterprise-rag-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://enterprise_user:enterprise_password@db:5432/enterprise_rag
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    volumes:
+      - ./uploads:/app/uploads
+      - ./chroma_data:/app/chroma_data
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: enterprise-rag-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
 
 volumes:
   postgres_data:

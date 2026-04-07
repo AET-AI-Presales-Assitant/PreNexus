@@ -1,11 +1,11 @@
 import os
 import shutil
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, inspect
+from sqlalchemy import desc, inspect, text
 from pydantic import BaseModel
 from datetime import datetime
 import time
@@ -33,16 +33,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Pipeline globally (Ensure GOOGLE_API_KEY is set in environment or pass it)
-# Assuming it will be passed via env
-api_key = os.getenv("GEMINI_API_KEY", "AIzaSyBM_Xgk-b6M31axc_RqmY6nxEmKokX8DsU")
-try:
-    pipeline = KnowledgePipeline(api_key=api_key)
-except ImportError as e:
-    print(f"Warning: Could not initialize KnowledgePipeline due to missing imports. Details: {e}")
-    pipeline = None
-
-PENDING_FOLLOWUPS = {}
+# Initialize Pipeline globally
+api_key = os.getenv("GEMINI_API_KEY") or ""
+pipeline = None
+if api_key.strip():
+    try:
+        pipeline = KnowledgePipeline(api_key=api_key.strip())
+    except Exception as e:
+        print(f"Warning: Could not initialize KnowledgePipeline. Details: {e}")
+else:
+    print("Warning: GEMINI_API_KEY is not set. KnowledgePipeline is disabled.")
 
 # Seed Admin User
 def seed_admin(db: Session):
@@ -51,15 +51,20 @@ def seed_admin(db: Session):
         new_admin = models.User(
             username="admin",
             password="admin123",
-            role="Admin",
+            role="SuperManager",
             name="System Admin"
         )
         db.add(new_admin)
         db.commit()
         print("Admin user seeded")
+        return
+    if admin.role != "SuperManager":
+        admin.role = "SuperManager"
+        db.commit()
 
 @app.on_event("startup")
 def startup_event():
+    models.Base.metadata.create_all(bind=engine)
     db = next(get_db())
     seed_admin(db)
 
@@ -100,6 +105,17 @@ class ChatRequest(BaseModel):
 class AnalyzeGapsRequest(BaseModel):
     queries: List[str]
 
+class AdminUserCreateRequest(BaseModel):
+    username: str
+    password: str
+    name: str
+    role: str
+
+class AdminUserUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+
 # --- Endpoints ---
 
 def to_dict(obj):
@@ -122,7 +138,52 @@ def to_dict(obj):
         d['userId'] = d.pop('user_id')
     if 'session_id' in d:
         d['sessionId'] = d.pop('session_id')
-        
+    if 'parent_job_id' in d:
+        d['parentJobId'] = d.pop('parent_job_id')
+    if 'file_name' in d:
+        d['fileName'] = d.pop('file_name')
+    if 'file_path' in d:
+        d['filePath'] = d.pop('file_path')
+    if 'started_at' in d:
+        d['startedAt'] = d.pop('started_at')
+    if 'finished_at' in d:
+        d['finishedAt'] = d.pop('finished_at')
+    if 'rolled_back_at' in d:
+        d['rolledBackAt'] = d.pop('rolled_back_at')
+    if 'num_chunks_total' in d:
+        d['numChunksTotal'] = d.pop('num_chunks_total')
+    if 'num_chunks_success' in d:
+        d['numChunksSuccess'] = d.pop('num_chunks_success')
+    if 'num_summary_docs' in d:
+        d['numSummaryDocs'] = d.pop('num_summary_docs')
+    if 'num_chunk_docs' in d:
+        d['numChunkDocs'] = d.pop('num_chunk_docs')
+    if 'num_embeddings' in d:
+        d['numEmbeddings'] = d.pop('num_embeddings')
+    if 'embedding_model' in d:
+        d['embeddingModel'] = d.pop('embedding_model')
+    if 'errors_json' in d:
+        d['errors'] = d.pop('errors_json')
+    if 'vector_ids_json' in d:
+        d['vectorIds'] = d.pop('vector_ids_json')
+    if 'chunk_ids_json' in d:
+        d['chunkIds'] = d.pop('chunk_ids_json')
+    return d
+
+def _safe_json_load(s: str):
+    try:
+        return json.loads(s) if isinstance(s, str) and s.strip() else None
+    except Exception:
+        return None
+
+def ingest_job_to_dict(job: models.IngestJob):
+    d = to_dict(job) or {}
+    if isinstance(d.get("errors"), str):
+        d["errors"] = _safe_json_load(d["errors"]) or []
+    if isinstance(d.get("vectorIds"), str):
+        d["vectorIds"] = _safe_json_load(d["vectorIds"]) or []
+    if isinstance(d.get("chunkIds"), str):
+        d["chunkIds"] = _safe_json_load(d["chunkIds"]) or []
     return d
 
 @app.post("/api/login")
@@ -205,15 +266,35 @@ def create_message(req: MessageCreateRequest, db: Session = Depends(get_db)):
     return {"success": True, "message": to_dict(new_msg)}
 
 def _role_level(role: str) -> int:
-    levels = {"Guest": 1, "Employee": 2, "Admin": 3}
-    return levels.get(role or "", 0)
+    r = (role or "").strip()
+    if r.lower() == "admin":
+        r = "SuperManager"
+    levels = {"Employee": 1, "Lead": 2, "Manager": 3, "SuperManager": 4}
+    return levels.get(r, 0)
+
+def _normalize_role_value(role: Optional[str]) -> Optional[str]:
+    if role is None:
+        return None
+    r = str(role).strip()
+    if not r:
+        return None
+    rl = r.lower().replace("_", "").replace(" ", "")
+    if rl == "admin" or rl == "supermanager" or rl == "supermanager":
+        return "SuperManager"
+    if rl == "employee":
+        return "Employee"
+    if rl == "lead":
+        return "Lead"
+    if rl == "manager":
+        return "Manager"
+    return None
 
 def _get_user_role(db: Session, user_id: Optional[str], fallback_role: str) -> str:
     if user_id:
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if user and user.role:
-            return user.role
-    return fallback_role
+            return _normalize_role_value(user.role) or user.role
+    return _normalize_role_value(fallback_role) or fallback_role
 
 def _coerce_llm_content_to_text(content) -> str:
     if content is None:
@@ -594,50 +675,6 @@ def _analyst_gap_analysis(llm, query: str, history_text: str, context_blocks: Li
     except Exception:
         return {"has_internal_data": bool(context_blocks), "gaps": [], "questions_to_user": []}
 
-def _pending_key_for_request(req: ChatRequest) -> Optional[str]:
-    if getattr(req, "sessionId", None):
-        return f"s:{req.sessionId}"
-    if getattr(req, "userId", None):
-        return f"u:{req.userId}"
-    return None
-
-def _fallback_questions_for_user(query: str, lang: str) -> List[str]:
-    if lang == "en":
-        return [
-            "What project/client context are you asking about? (project name, industry, size)",
-            "What output format do you need? (quick answer / proposal / checklist / email reply)",
-            "Are there any required technologies/stacks? (e.g., React, FastAPI, AWS, GCP...)",
-            "Any constraints on timeline/budget/team?",
-            "Can you provide 2–3 must-have requirements and any nice-to-have items?"
-        ]
-    return [
-        "Bạn đang hỏi trong bối cảnh dự án/khách hàng nào? (tên dự án, ngành, quy mô)",
-        "Bạn cần đầu ra ở dạng gì? (tư vấn nhanh / proposal / checklist / email trả lời)",
-        "Có công nghệ/stack bắt buộc không? (ví dụ: React, FastAPI, AWS, GCP...)",
-        "Có ràng buộc về timeline/budget/đội ngũ không?",
-        "Bạn có thể cung cấp 2–3 điểm yêu cầu chính (must-have) và điểm ưu tiên (nice-to-have)?"
-    ]
-
-def _format_followup_message(questions: List[str], query: str, lang: str) -> str:
-    qs = [q.strip() for q in (questions or []) if isinstance(q, str) and q.strip()]
-    if not qs:
-        qs = _fallback_questions_for_user(query, lang)
-    i18n = _i18n(lang)
-    lines = [i18n["followup_intro"], "", i18n["followup_prompt"]]
-    for i, q in enumerate(qs[:5], start=1):
-        lines.append(f"{i}) {q}")
-    return "\n".join(lines).strip()
-
-def _extract_followup_questions(analysis: dict, query: str, lang: str) -> List[str]:
-    qs = []
-    if isinstance(analysis, dict):
-        raw = analysis.get("questions_to_user")
-        if isinstance(raw, list):
-            qs = [q.strip() for q in raw if isinstance(q, str) and q.strip()]
-    if not qs:
-        qs = _fallback_questions_for_user(query, lang)
-    return qs[:5]
-
 def _rewrite_query_for_retrieval(llm, query: str) -> str:
     prompt = f"""
         You are a Query Rewriter Agent (Retrieval Optimizer). Task: Rewrite the user query to improve retrieval against a company knowledge base.
@@ -686,15 +723,6 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
         query_effective = query
         lang = _detect_language(query_effective)
         i18n = _i18n(lang)
-        pending_key = _pending_key_for_request(req)
-        if pending_key and pending_key in PENDING_FOLLOWUPS:
-            pending = PENDING_FOLLOWUPS.pop(pending_key, None) or {}
-            original_query = pending.get("original_query") if isinstance(pending.get("original_query"), str) else ""
-            if original_query.strip():
-                query_effective = f"{original_query}\n\n" + ("Additional information from the user:\n" if lang == "en" else "Thông tin bổ sung từ người dùng:\n") + f"{query}"
-                lang = _detect_language(original_query)
-                i18n = _i18n(lang)
-                yield _yield_event("trace", {"step": "Decomposition", "details": "Router Agent: nhận câu trả lời bổ sung và tiếp tục workflow..." if lang == "vi" else "Router Agent: received additional answers and continue the workflow...", "status": "pending"})
 
         yield _yield_event("trace", {"step": "Decomposition", "details": "Router Agent: phân loại yêu cầu và chọn workflow..." if lang == "vi" else "Router Agent: categorize requirements and select workflow...", "status": "pending"})
         plan = _router_agent_plan(pipeline.llm, query_effective, history_text, lang)
@@ -709,6 +737,7 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
         )
 
         def _retrieve(q: str):
+            max_dist = float(os.getenv("RAG_MAX_DISTANCE", "0.75") or "0.75")
             retrieved_local = pipeline.vectorstore.similarity_search_with_score(q, k=max(top_k * 10, 20))
             qtoks = set(_tokenize(q))
             scored = []
@@ -718,15 +747,23 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
                 if _role_level(user_role) < _role_level(doc_role):
                     continue
 
+                try:
+                    dist_f = float(dist) if dist is not None else 999.0
+                except Exception:
+                    dist_f = 999.0
+
                 tags = meta.get("tags", "") or ""
                 title = meta.get("chunk_title", "") or ""
                 category = meta.get("category", "") or ""
                 keys = set(_tokenize(tags) + _tokenize(title) + _tokenize(category) + _tokenize(doc.page_content or ""))
                 overlap = len(qtoks.intersection(keys))
 
-                sim = 1.0 / (1.0 + float(dist)) if dist is not None else 0.0
+                if dist_f > max_dist:
+                    continue
+
+                sim = 1.0 / (1.0 + dist_f)
                 combined = sim + (0.12 * overlap)
-                scored.append((doc, float(dist) if dist is not None else 0.0, combined, overlap))
+                scored.append((doc, dist_f, combined, overlap))
 
             scored.sort(key=lambda x: x[2], reverse=True)
             return scored
@@ -797,21 +834,12 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
         accessible = [(d, dist) for (d, dist, _combined, _overlap) in accessible_scored]
 
         if not accessible:
-            yield _yield_event("trace", {"step": "Critique", "details": "Analyst Agent: thiếu dữ liệu nội bộ. Chuẩn bị câu hỏi làm rõ..." if lang == "vi" else "Analyst Agent: missing internal data. Preparing clarification questions...", "status": "pending"})
-            analysis = _analyst_gap_analysis(pipeline.llm, query_effective, history_text, [], lang)
-            questions = _extract_followup_questions(analysis, query_effective, lang)
-            if pending_key:
-                PENDING_FOLLOWUPS[pending_key] = {
-                    "original_query": query_effective,
-                    "questions": questions,
-                    "created_at": time.time()
-                }
-            yield _yield_event("trace", {"step": "Critique", "details": (f"Analyst Agent: cần {len(questions)} thông tin bổ sung từ người dùng." if lang == "vi" else f"Analyst Agent: need {len(questions)} more inputs from the user."), "status": "success"})
-            yield _yield_event("trace", {"step": "Synthesis", "details": "Synthesis Agent: gửi câu hỏi làm rõ để tiếp tục workflow." if lang == "vi" else "Synthesis Agent: asking follow-up questions to continue the workflow.", "status": "success"})
-            answer = _format_followup_message(questions, query_effective, lang)
+            yield _yield_event("trace", {"step": "Critique", "details": "Analyst Agent: thiếu dữ liệu nội bộ." if lang == "vi" else "Analyst Agent: missing internal data.", "status": "success"})
+            yield _yield_event("trace", {"step": "Synthesis", "details": "Synthesis Agent: hoàn tất." if lang == "vi" else "Synthesis Agent: completed.", "status": "success"})
+            answer = i18n["no_internal_data"]
             yield _yield_event("answer_start", {})
             yield _yield_event("chunk", {"content": answer})
-            yield _yield_event("done", {"citations": [], "used_docs": [], "answer": answer, "followup": {"required": True, "questions": questions}})
+            yield _yield_event("done", {"citations": [], "used_docs": [], "answer": answer})
             return
 
         doc_ids = []
@@ -822,18 +850,19 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
                 doc_ids.append(str(did))
 
         chunk_map = {}
-        try:
-            chunks = pipeline.chunkstore.get(ids=doc_ids, include=["documents", "metadatas"])
-            ids = chunks.get("ids") if chunks and chunks.get("ids") is not None else []
-            docs = chunks.get("documents") if chunks and chunks.get("documents") is not None else []
-            metas = chunks.get("metadatas") if chunks and chunks.get("metadatas") is not None else []
-            for i in range(len(ids)):
-                chunk_map[str(ids[i])] = {
-                    "content": docs[i] if i < len(docs) else "",
-                    "metadata": metas[i] if i < len(metas) else {}
-                }
-        except Exception as e:
-            print(f"Error loading chunks: {e}")
+        if hasattr(pipeline, "chunkstore") and getattr(pipeline, "chunkstore") is not None:
+            try:
+                chunks = pipeline.chunkstore.get(ids=doc_ids, include=["documents", "metadatas"])
+                ids = chunks.get("ids") if chunks and chunks.get("ids") is not None else []
+                docs = chunks.get("documents") if chunks and chunks.get("documents") is not None else []
+                metas = chunks.get("metadatas") if chunks and chunks.get("metadatas") is not None else []
+                for i in range(len(ids)):
+                    chunk_map[str(ids[i])] = {
+                        "content": docs[i] if i < len(docs) else "",
+                        "metadata": metas[i] if i < len(metas) else {}
+                    }
+            except Exception as e:
+                print(f"Error loading chunks: {e}")
 
         citations = []
         context_blocks = []
@@ -922,7 +951,14 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
             yield _yield_event("clear", {})
             yield _yield_event("chunk", {"content": full_answer})
 
-        citations_used, used_docs_used = _select_sources_from_answer(full_answer, citations, used_docs, max_sources=5)
+        answer_norm = _normalize_for_match(full_answer)
+        no_data_norm = _normalize_for_match(i18n["no_internal_data"])
+        is_no_internal_data = bool(answer_norm and no_data_norm and answer_norm == no_data_norm)
+
+        if is_no_internal_data:
+            citations_used, used_docs_used = [], []
+        else:
+            citations_used, used_docs_used = _select_sources_from_answer(full_answer, citations, used_docs, max_sources=5)
 
         yield _yield_event("trace", {"step": "Synthesis", "details": "Synthesis Agent: hoàn tất." if lang == "vi" else "Synthesis Agent: completed.", "status": "success"})
         # Save to database in a separate session context since Depends(get_db) might close it during streaming? 
@@ -968,10 +1004,18 @@ def analyze_gaps(req: AnalyzeGapsRequest):
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, db: Session = Depends(get_db)):
-    db.query(models.Message).filter(models.Message.session_id == session_id).delete()
-    db.query(models.Session).filter(models.Session.id == session_id).delete()
-    db.commit()
-    return {"success": True}
+    try:
+        try:
+            db.execute(text("DELETE FROM followup_contexts WHERE session_id = :sid"), {"sid": session_id})
+        except Exception:
+            db.rollback()
+        db.query(models.Message).filter(models.Message.session_id == session_id).delete()
+        db.query(models.Session).filter(models.Session.id == session_id).delete()
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "message": str(e)}
 
 @app.put("/api/sessions/{session_id}")
 def update_session(session_id: str, req: SessionUpdateRequest, db: Session = Depends(get_db)):
@@ -990,8 +1034,46 @@ def get_admin_users(db: Session = Depends(get_db)):
     for u in users:
         u_dict = to_dict(u)
         u_dict.pop('password', None)
+        if isinstance(u_dict.get("role"), str):
+            u_dict["role"] = _normalize_role_value(u_dict["role"]) or u_dict["role"]
         safe_users.append(u_dict)
     return {"success": True, "users": safe_users}
+
+@app.post("/api/admin/users")
+def admin_create_user(req: AdminUserCreateRequest, db: Session = Depends(get_db)):
+    role = _normalize_role_value(req.role)
+    if not role:
+        return {"success": False, "message": "Invalid role"}
+    existing = db.query(models.User).filter(models.User.username == req.username).first()
+    if existing:
+        return {"success": False, "message": "Username already exists"}
+    u = models.User(username=req.username, password=req.password, name=req.name, role=role)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    u_dict = to_dict(u)
+    u_dict.pop("password", None)
+    return {"success": True, "user": u_dict}
+
+@app.put("/api/admin/users/{user_id}")
+def admin_update_user(user_id: str, req: AdminUserUpdateRequest, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        return {"success": False, "message": "User not found"}
+    if isinstance(req.name, str) and req.name.strip():
+        user.name = req.name.strip()
+    if isinstance(req.password, str) and req.password.strip():
+        user.password = req.password
+    if req.role is not None:
+        role = _normalize_role_value(req.role)
+        if not role:
+            return {"success": False, "message": "Invalid role"}
+        user.role = role
+    db.commit()
+    db.refresh(user)
+    u_dict = to_dict(user)
+    u_dict.pop("password", None)
+    return {"success": True, "user": u_dict}
 
 @app.get("/api/admin/analytics")
 def get_admin_analytics(db: Session = Depends(get_db)):
@@ -1041,7 +1123,7 @@ def get_admin_analytics(db: Session = Depends(get_db)):
     return {"success": True, "queries": queries}
 
 @app.post("/api/admin/import")
-async def import_data(file: UploadFile = File(...), role: str = Form("Employee")):
+async def import_data(background_tasks: BackgroundTasks, file: UploadFile = File(...), role: str = Form("Employee"), db: Session = Depends(get_db)):
     if not file:
         raise HTTPException(status_code=400, detail={"success": False, "message": "No file uploaded"})
     
@@ -1052,13 +1134,184 @@ async def import_data(file: UploadFile = File(...), role: str = Form("Employee")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
+    job = models.IngestJob(file_name=file.filename, file_path=file_path, role=role, status="queued")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    def _run_job(job_id: str):
+        db_local = next(get_db())
+        try:
+            j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
+            if not j:
+                return
+            j.status = "processing"
+            j.started_at = datetime.utcnow()
+            j.error = None
+            j.errors_json = None
+            j.vector_ids_json = None
+            j.chunk_ids_json = None
+            j.num_chunks_total = None
+            j.num_chunks_success = None
+            j.num_summary_docs = None
+            j.num_chunk_docs = None
+            j.num_embeddings = None
+            j.embedding_model = None
+            db_local.commit()
+
+            if not pipeline:
+                raise RuntimeError("Pipeline not initialized")
+
+            result = pipeline.process_and_ingest(j.file_path, j.role)
+            vector_ids = result.get("vector_ids") if isinstance(result, dict) else []
+            chunk_ids = result.get("chunk_ids") if isinstance(result, dict) else []
+            errors = result.get("errors") if isinstance(result, dict) else []
+
+            j.status = "success"
+            j.finished_at = datetime.utcnow()
+            j.num_chunks_total = int(result.get("num_chunks_total") or 0) if isinstance(result, dict) else None
+            j.num_chunks_success = int(result.get("num_chunks_success") or 0) if isinstance(result, dict) else None
+            j.num_summary_docs = int(result.get("num_summary_docs") or 0) if isinstance(result, dict) else None
+            j.num_chunk_docs = int(result.get("num_chunk_docs") or 0) if isinstance(result, dict) else None
+            j.num_embeddings = (j.num_summary_docs or 0) + (j.num_chunk_docs or 0)
+            j.embedding_model = str(result.get("embedding_model") or "") if isinstance(result, dict) else None
+            j.vector_ids_json = json.dumps(vector_ids or [])
+            j.chunk_ids_json = json.dumps(chunk_ids or [])
+            j.errors_json = json.dumps(errors or [])
+            db_local.commit()
+        except Exception as e:
+            try:
+                j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
+                if j:
+                    j.status = "error"
+                    j.finished_at = datetime.utcnow()
+                    j.error = str(e)
+                    db_local.commit()
+            except Exception:
+                pass
+        finally:
+            db_local.close()
+
+    background_tasks.add_task(_run_job, str(job.id))
+    return {"success": True, "job": ingest_job_to_dict(job)}
+
+@app.get("/api/files/{file_name}")
+def get_uploaded_file(file_name: str):
+    safe_name = os.path.basename(file_name or "")
+    if not safe_name:
+        return {"success": False, "message": "Invalid file name"}
+    if not safe_name.lower().endswith(".pdf"):
+        return {"success": False, "message": "Only PDF files are supported"}
+    upload_dir = os.path.join(os.getcwd(), "uploads")
+    file_path = os.path.join(upload_dir, safe_name)
+    if not os.path.exists(file_path):
+        return {"success": False, "message": "File not found"}
+    headers = {"Content-Disposition": f'inline; filename=\"{safe_name}\"'}
+    return FileResponse(file_path, media_type="application/pdf", headers=headers)
+
+@app.get("/api/admin/ingest_jobs")
+def list_ingest_jobs(limit: int = 50, db: Session = Depends(get_db)):
+    q = db.query(models.IngestJob).order_by(desc(models.IngestJob.created_at)).limit(max(1, min(limit, 200)))
+    return {"success": True, "jobs": [ingest_job_to_dict(j) for j in q.all()]}
+
+@app.get("/api/admin/ingest_jobs/{job_id}")
+def get_ingest_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
+    if not job:
+        return {"success": False, "message": "Job not found"}
+    return {"success": True, "job": ingest_job_to_dict(job)}
+
+@app.post("/api/admin/ingest_jobs/{job_id}/retry")
+def retry_ingest_job(job_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    job = db.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
+    if not job:
+        return {"success": False, "message": "Job not found"}
+    new_job = models.IngestJob(
+        parent_job_id=job.id,
+        file_name=job.file_name,
+        file_path=job.file_path,
+        role=job.role,
+        status="queued"
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+
+    def _run_job(job_id2: str):
+        db_local = next(get_db())
+        try:
+            j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id2).first()
+            if not j:
+                return
+            j.status = "processing"
+            j.started_at = datetime.utcnow()
+            j.error = None
+            j.errors_json = None
+            j.vector_ids_json = None
+            j.chunk_ids_json = None
+            db_local.commit()
+
+            if not pipeline:
+                raise RuntimeError("Pipeline not initialized")
+
+            result = pipeline.process_and_ingest(j.file_path, j.role)
+            vector_ids = result.get("vector_ids") if isinstance(result, dict) else []
+            chunk_ids = result.get("chunk_ids") if isinstance(result, dict) else []
+            errors = result.get("errors") if isinstance(result, dict) else []
+
+            j.status = "success"
+            j.finished_at = datetime.utcnow()
+            j.num_chunks_total = int(result.get("num_chunks_total") or 0) if isinstance(result, dict) else None
+            j.num_chunks_success = int(result.get("num_chunks_success") or 0) if isinstance(result, dict) else None
+            j.num_summary_docs = int(result.get("num_summary_docs") or 0) if isinstance(result, dict) else None
+            j.num_chunk_docs = int(result.get("num_chunk_docs") or 0) if isinstance(result, dict) else None
+            j.num_embeddings = (j.num_summary_docs or 0) + (j.num_chunk_docs or 0)
+            j.embedding_model = str(result.get("embedding_model") or "") if isinstance(result, dict) else None
+            j.vector_ids_json = json.dumps(vector_ids or [])
+            j.chunk_ids_json = json.dumps(chunk_ids or [])
+            j.errors_json = json.dumps(errors or [])
+            db_local.commit()
+        except Exception as e:
+            try:
+                j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id2).first()
+                if j:
+                    j.status = "error"
+                    j.finished_at = datetime.utcnow()
+                    j.error = str(e)
+                    db_local.commit()
+            except Exception:
+                pass
+        finally:
+            db_local.close()
+
+    background_tasks.add_task(_run_job, str(new_job.id))
+    return {"success": True, "job": ingest_job_to_dict(new_job)}
+
+@app.post("/api/admin/ingest_jobs/{job_id}/rollback")
+def rollback_ingest_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
+    if not job:
+        return {"success": False, "message": "Job not found"}
+    if job.status not in ["success", "error"]:
+        return {"success": False, "message": "Job is not eligible for rollback"}
+    if job.rolled_back_at is not None:
+        return {"success": False, "message": "Job already rolled back"}
+    vector_ids = _safe_json_load(job.vector_ids_json) or []
+    chunk_ids = _safe_json_load(job.chunk_ids_json) or []
+    if not pipeline:
+        return {"success": False, "message": "Pipeline not initialized"}
     try:
-        print(f"Processing uploaded file directly in FastAPI: {file_path}")
-        pipeline.process_and_ingest(file_path, role)
-        return {"success": True, "message": f"File {file.filename} processed and ingested successfully"}
+        if vector_ids:
+            pipeline.vectorstore.delete(ids=list(vector_ids))
+        if chunk_ids and hasattr(pipeline, "chunkstore") and getattr(pipeline, "chunkstore") is not None:
+            pipeline.chunkstore.delete(ids=list(chunk_ids))
+        job.status = "rolled_back"
+        job.rolled_back_at = datetime.utcnow()
+        db.commit()
+        db.refresh(job)
+        return {"success": True, "job": ingest_job_to_dict(job)}
     except Exception as e:
-        print(f"Error processing file: {e}")
-        return {"success": False, "message": "Error processing file", "error": str(e)}
+        return {"success": False, "message": "Rollback failed", "error": str(e)}
 
 @app.get("/api/admin/documents")
 def get_documents():
@@ -1090,13 +1343,20 @@ def get_documents():
                 if embedding is not None and hasattr(embedding, "tolist"):
                     embedding = embedding.tolist()
                 
+                src = metadata.get("source", "") or ""
+                src_name = src.split("/")[-1].split("\\")[-1] if src else ""
+                tags_raw = metadata.get("tags", "") or ""
+                tags = [t.strip() for t in str(tags_raw).split(",") if str(t).strip()]
+
                 documents.append({
                     "id": doc_id,
                     "title": metadata.get("chunk_title") or metadata.get("source", "Unknown Document").split("/")[-1].split("\\")[-1],
                     "content": content,
-                    "role": metadata.get("role", "Employee"),
+                    "role": _normalize_role_value(metadata.get("role")) or "Employee",
                     "topic": metadata.get("category", "General"),
                     "createdAt": metadata.get("createdAt"),
+                    "source": src_name,
+                    "tags": tags,
                     "embedding": embedding
                 })
         return {"success": True, "documents": documents}

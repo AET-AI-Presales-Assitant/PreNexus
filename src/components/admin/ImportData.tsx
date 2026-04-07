@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { Upload, FileText, CheckCircle, AlertCircle, File, FolderOpen, Loader2, Clock, Check, X } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Role, Document } from '../../lib/vectorStore';
+import { apiUrl } from '../../lib/api';
 
 interface ImportDataProps {
   onImport: (title: string, content: string, role: Role, topic?: string) => Promise<void>;
@@ -11,8 +12,16 @@ interface ImportDataProps {
 interface UploadProgress {
   file: File;
   progress: number;
-  status: 'uploading' | 'processing' | 'success' | 'error';
+  status: 'uploading' | 'processing' | 'success' | 'error' | 'rolled_back';
   message?: string;
+  jobId?: string;
+  numChunksTotal?: number;
+  numChunksSuccess?: number;
+  numSummaryDocs?: number;
+  numChunkDocs?: number;
+  numEmbeddings?: number;
+  embeddingModel?: string;
+  errors?: string[];
 }
 
 export function ImportData({ onImport, existingDocs }: ImportDataProps) {
@@ -20,6 +29,96 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
   const [role, setRole] = useState<Role>('Employee');
   const [dragActive, setDragActive] = useState(false);
   const [uploadTasks, setUploadTasks] = useState<UploadProgress[]>([]);
+
+  const refreshJob = async (jobId: string) => {
+    const response = await fetch(apiUrl(`/admin/ingest_jobs/${jobId}`));
+    const data = await response.json();
+    if (!data.success) throw new Error(data.message || 'Failed to fetch job');
+    return data.job;
+  };
+
+  const startPolling = (fileName: string, jobId: string) => {
+    const interval = setInterval(async () => {
+      try {
+        const job = await refreshJob(jobId);
+        const st = String(job.status || 'processing');
+        const nextStatus: UploadProgress['status'] =
+          st === 'success' ? 'success' :
+          st === 'error' ? 'error' :
+          st === 'rolled_back' ? 'rolled_back' :
+          'processing';
+
+        setUploadTasks(prev => prev.map(t => {
+          if (t.file.name !== fileName) return t;
+          return {
+            ...t,
+            status: nextStatus,
+            progress: nextStatus === 'success' || nextStatus === 'error' || nextStatus === 'rolled_back'
+              ? 100
+              : Math.max(t.progress, 35),
+            message: nextStatus === 'success'
+              ? 'Imported successfully'
+              : nextStatus === 'error'
+                ? (job.error || 'Failed to process file')
+                : nextStatus === 'rolled_back'
+                  ? 'Rolled back'
+                  : 'Processing',
+            numChunksTotal: job.numChunksTotal ?? t.numChunksTotal,
+            numChunksSuccess: job.numChunksSuccess ?? t.numChunksSuccess,
+            numSummaryDocs: job.numSummaryDocs ?? t.numSummaryDocs,
+            numChunkDocs: job.numChunkDocs ?? t.numChunkDocs,
+            numEmbeddings: job.numEmbeddings ?? t.numEmbeddings,
+            embeddingModel: job.embeddingModel ?? t.embeddingModel,
+            errors: Array.isArray(job.errors) ? job.errors : t.errors
+          };
+        }));
+
+        if (st === 'success') {
+          clearInterval(interval);
+          await onImport(fileName, "File imported", role, 'General');
+        }
+        if (st === 'error' || st === 'rolled_back') {
+          clearInterval(interval);
+        }
+      } catch (e: any) {
+        setUploadTasks(prev => prev.map(t =>
+          t.file.name === fileName ? { ...t, status: 'error', progress: 100, message: e?.message || 'Failed to poll job' } : t
+        ));
+        clearInterval(interval);
+      }
+    }, 1200);
+  };
+
+  const retryTask = async (task: UploadProgress) => {
+    if (!task.jobId) return;
+    const response = await fetch(apiUrl(`/admin/ingest_jobs/${task.jobId}/retry`), { method: 'POST' });
+    const data = await response.json();
+    if (!data.success) throw new Error(data.message || 'Retry failed');
+    const job = data.job;
+    setUploadTasks(prev => prev.map(t => t.file.name === task.file.name ? {
+      ...t,
+      status: 'processing',
+      progress: 35,
+      message: 'Processing',
+      jobId: job?.id,
+      errors: []
+    } : t));
+    if (job?.id) startPolling(task.file.name, job.id);
+  };
+
+  const rollbackTask = async (task: UploadProgress) => {
+    if (!task.jobId) return;
+    const response = await fetch(apiUrl(`/admin/ingest_jobs/${task.jobId}/rollback`), { method: 'POST' });
+    const data = await response.json();
+    if (!data.success) throw new Error(data.message || 'Rollback failed');
+    setUploadTasks(prev => prev.map(t => t.file.name === task.file.name ? {
+      ...t,
+      status: 'rolled_back',
+      progress: 100,
+      message: 'Rolled back'
+    } : t));
+    await onImport(task.file.name, "Rolled back", role, 'General');
+  };
 
   // Group docs by topic
   const docsByTopic = useMemo(() => {
@@ -36,7 +135,6 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
     // Chuyển sang tab progress ngay lập tức
     setActiveTab('progress');
     
-    // Thêm task mới vào danh sách
     const newTask: UploadProgress = { file, progress: 10, status: 'uploading' };
     setUploadTasks(prev => [newTask, ...prev]);
 
@@ -44,39 +142,22 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
       const formData = new FormData();
       formData.append('file', file);
       formData.append('role', role);
-      
-      // Giả lập tiến trình upload
-      const progressInterval = setInterval(() => {
-        setUploadTasks(prev => prev.map(task => 
-          task.file.name === file.name && task.status === 'uploading'
-            ? { ...task, progress: Math.min(task.progress + 15, 90) }
-            : task
-        ));
-      }, 500);
 
-      const response = await fetch('http://localhost:3005/api/admin/import', {
+      const response = await fetch(apiUrl('/admin/import'), {
         method: 'POST',
         body: formData,
       });
 
-      clearInterval(progressInterval);
-
       const data = await response.json();
 
       if (data.success) {
-        setUploadTasks(prev => prev.map(task => 
-          task.file.name === file.name 
-            ? { ...task, progress: 100, status: 'success', message: 'Imported successfully' }
+        const job = data.job;
+        setUploadTasks(prev => prev.map(task =>
+          task.file.name === file.name
+            ? { ...task, progress: 35, status: 'processing', message: 'Processing', jobId: job?.id }
             : task
         ));
-        
-        // Gọi callback onImport để cập nhật lại danh sách documents ở frontend state
-        // Chúng ta có thể trigger việc cập nhật ở đây bằng cách truyền text "Đã import thành công" để KnowledgeBase biết có doc mới
-        // Tuy nhiên hàm onImport gốc của bạn nhận vào title, content, role. 
-        // Nên chúng ta sẽ gọi tạm với dữ liệu trống để App.tsx biết có doc mới và load lại (nếu bạn có cơ chế reload)
-        // Hiện tại onImport sẽ tự thêm 1 doc ảo vào state frontend. 
-        // Để không lỗi, ta gọi onImport với content là file name
-        await onImport(file.name, "File imported to ChromaDB", role, 'General');
+        if (job?.id) startPolling(file.name, job.id);
       } else {
         setUploadTasks(prev => prev.map(task => 
           task.file.name === file.name 
@@ -190,8 +271,8 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
                       <h4 className="font-semibold text-neutral-900 mb-4 flex items-center gap-2">
                           <FileText className="w-4 h-4" /> Access Control
                       </h4>
-                      <div className="flex gap-4">
-                          {(['Guest', 'Employee', 'Admin'] as Role[]).map((r) => (
+                      <div className="flex gap-4 flex-wrap">
+                          {(['Employee', 'Lead', 'Manager', 'SuperManager'] as Role[]).map((r) => (
                               <label key={r} className="flex items-center gap-2 cursor-pointer bg-white px-4 py-2 rounded-lg border border-neutral-200 shadow-sm hover:border-indigo-300 transition-all">
                                   <input
                                       type="radio"
@@ -201,7 +282,7 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
                                       onChange={(e) => setRole(e.target.value as Role)}
                                       className="text-indigo-600 focus:ring-indigo-500"
                                   />
-                                  <span className="text-sm font-medium text-neutral-700">{r}</span>
+                                  <span className="text-sm font-medium text-neutral-700">{r === 'SuperManager' ? 'Super Manager' : r}</span>
                               </label>
                           ))}
                       </div>
@@ -234,10 +315,12 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
                       <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
                         task.status === 'success' ? 'bg-green-100 text-green-600' :
                         task.status === 'error' ? 'bg-red-100 text-red-600' :
+                        task.status === 'rolled_back' ? 'bg-neutral-100 text-neutral-600' :
                         'bg-indigo-100 text-indigo-600'
                       }`}>
                         {task.status === 'success' ? <Check className="w-5 h-5" /> :
                          task.status === 'error' ? <X className="w-5 h-5" /> :
+                         task.status === 'rolled_back' ? <X className="w-5 h-5" /> :
                          <FileText className="w-5 h-5" />}
                       </div>
                       <div>
@@ -248,17 +331,37 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
                           <span>{(task.file.size / 1024 / 1024).toFixed(2)} MB</span>
                           <span className="w-1 h-1 bg-neutral-300 rounded-full"></span>
                           <span className="capitalize">{task.status}</span>
+                          {task.embeddingModel && (
+                            <>
+                              <span className="w-1 h-1 bg-neutral-300 rounded-full"></span>
+                              <span>{task.embeddingModel}</span>
+                            </>
+                          )}
                         </p>
                       </div>
                     </div>
-                    <div className="text-right">
-                      {task.status === 'uploading' || task.status === 'processing' ? (
-                        <span className="text-sm font-bold text-indigo-600">{task.progress}%</span>
-                      ) : task.status === 'success' ? (
-                        <span className="text-sm font-medium text-green-600 flex items-center gap-1"><CheckCircle className="w-4 h-4"/> Done</span>
-                      ) : (
-                        <span className="text-sm font-medium text-red-600 flex items-center gap-1"><AlertCircle className="w-4 h-4"/> Failed</span>
+                    <div className="flex items-center gap-2">
+                      {task.status === 'error' && (
+                        <Button variant="outline" size="sm" className="h-8" onClick={() => retryTask(task)}>
+                          Retry
+                        </Button>
                       )}
+                      {task.status === 'success' && (
+                        <Button variant="outline" size="sm" className="h-8" onClick={() => rollbackTask(task)}>
+                          Rollback
+                        </Button>
+                      )}
+                      <div className="text-right min-w-[76px]">
+                        {task.status === 'uploading' || task.status === 'processing' ? (
+                          <span className="text-sm font-bold text-indigo-600">{task.progress}%</span>
+                        ) : task.status === 'success' ? (
+                          <span className="text-sm font-medium text-green-600 flex items-center justify-end gap-1"><CheckCircle className="w-4 h-4"/> Done</span>
+                        ) : task.status === 'rolled_back' ? (
+                          <span className="text-sm font-medium text-neutral-600 flex items-center justify-end gap-1"><X className="w-4 h-4"/> Rolled back</span>
+                        ) : (
+                          <span className="text-sm font-medium text-red-600 flex items-center justify-end gap-1"><AlertCircle className="w-4 h-4"/> Failed</span>
+                        )}
+                      </div>
                     </div>
                   </div>
 
@@ -268,6 +371,7 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
                       className={`h-2 rounded-full transition-all duration-300 ${
                         task.status === 'success' ? 'bg-green-500' :
                         task.status === 'error' ? 'bg-red-500' :
+                        task.status === 'rolled_back' ? 'bg-neutral-400' :
                         'bg-indigo-600'
                       }`}
                       style={{ width: `${task.progress}%` }}
@@ -277,7 +381,10 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
                   {/* Status Message */}
                   {task.message && (
                     <p className={`text-xs mt-3 ${
-                      task.status === 'success' ? 'text-green-600' : 'text-red-600'
+                      task.status === 'success' ? 'text-green-600' :
+                      task.status === 'error' ? 'text-red-600' :
+                      task.status === 'rolled_back' ? 'text-neutral-600' :
+                      'text-indigo-600'
                     }`}>
                       {task.message}
                     </p>
@@ -289,6 +396,24 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       Analyzing and chunking document with AI...
                     </p>
+                  )}
+
+                  {(typeof task.numChunksTotal === 'number' || typeof task.numEmbeddings === 'number' || (task.errors && task.errors.length > 0)) && (
+                    <div className="mt-3 text-xs text-neutral-600 flex flex-wrap gap-x-4 gap-y-1">
+                      {typeof task.numChunksTotal === 'number' ? <span>Chunks: {task.numChunksSuccess ?? 0}/{task.numChunksTotal}</span> : null}
+                      {typeof task.numSummaryDocs === 'number' ? <span>Summaries: {task.numSummaryDocs}</span> : null}
+                      {typeof task.numChunkDocs === 'number' ? <span>Chunk docs: {task.numChunkDocs}</span> : null}
+                      {typeof task.numEmbeddings === 'number' ? <span>Embeddings: {task.numEmbeddings}</span> : null}
+                      {task.errors && task.errors.length > 0 ? <span>Errors: {task.errors.length}</span> : null}
+                    </div>
+                  )}
+
+                  {task.errors && task.errors.length > 0 && (
+                    <div className="mt-2 text-xs text-neutral-600 bg-neutral-50 border border-neutral-200 rounded-lg p-3 whitespace-pre-wrap">
+                      {task.errors.slice(0, 5).map((e, idx) => (
+                        <div key={idx}>- {e}</div>
+                      ))}
+                    </div>
                   )}
                 </div>
               ))

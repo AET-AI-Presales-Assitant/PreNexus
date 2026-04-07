@@ -65,22 +65,22 @@ export function Sidebar({
 
       <div className={cn(
         "fixed lg:relative inset-y-0 left-0 w-80 border-r flex flex-col h-full shrink-0 z-50 transition-transform duration-300 ease-in-out lg:translate-x-0",
-        userRole === 'Admin' ? "bg-[#1e293b] border-neutral-800" : "bg-[#F0F4F9] border-neutral-200",
+        userRole === 'SuperManager' ? "bg-[#1e293b] border-neutral-800" : "bg-[#F0F4F9] border-neutral-200",
         !isOpen && "-translate-x-full"
       )}>
-        <div className={cn("p-6 border-b flex items-center justify-between", userRole === 'Admin' ? "border-neutral-800" : "border-neutral-200")}>
+        <div className={cn("p-6 border-b flex items-center justify-between", userRole === 'SuperManager' ? "border-neutral-800" : "border-neutral-200")}>
           <div className="flex items-center gap-3">
-            <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center shadow-md", userRole === 'Admin' ? "bg-indigo-500" : "bg-indigo-600")}>
+            <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center shadow-md", userRole === 'SuperManager' ? "bg-indigo-500" : "bg-indigo-600")}>
               <Bot className="w-6 h-6 text-white" />
             </div>
             <div className="flex flex-col">
-              <h1 className={cn("text-lg font-bold tracking-tight leading-tight", userRole === 'Admin' ? "text-white" : "text-neutral-900")}>
+              <h1 className={cn("text-lg font-bold tracking-tight leading-tight", userRole === 'SuperManager' ? "text-white" : "text-neutral-900")}>
                 AI Presales
               </h1>
-              <span className={cn("text-sm font-medium leading-tight", userRole === 'Admin' ? "text-slate-400" : "text-neutral-500")}>Assistant</span>
+              <span className={cn("text-sm font-medium leading-tight", userRole === 'SuperManager' ? "text-slate-400" : "text-neutral-500")}>Assistant</span>
             </div>
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} className={cn("lg:hidden hover:border-transparent", userRole === 'Admin' ? "text-slate-400 hover:bg-slate-800 hover:text-white" : "text-neutral-500 hover:bg-neutral-200")}>
+          <Button variant="ghost" size="icon" onClick={onClose} className={cn("lg:hidden hover:border-transparent", userRole === 'SuperManager' ? "text-slate-400 hover:bg-slate-800 hover:text-white" : "text-neutral-500 hover:bg-neutral-200")}>
             <X className="w-5 h-5" />
           </Button>
         </div>
@@ -98,12 +98,36 @@ export function Sidebar({
           </section>
           )}
 
-        {userRole === 'Admin' && (
+        {userRole === 'SuperManager' && (
           <section className="space-y-4">
             <h2 className="text-xs font-bold text-slate-500 uppercase tracking-wider pl-2">
               Administrator
             </h2>
             <div className="space-y-1">
+              <Button
+                variant={activeAdminTab === 'users' ? 'secondary' : 'ghost'}
+                className={cn(
+                  "w-full justify-start gap-3 h-10 text-sm font-medium rounded-lg", 
+                  activeAdminTab === 'users' 
+                    ? "bg-indigo-500/10 text-indigo-400 shadow-sm hover:bg-indigo-500/10" 
+                    : "text-slate-400 hover:bg-slate-800 hover:text-white hover:border-transparent"
+                )}
+                onClick={() => onSelectAdminTab('users')}
+              >
+                <Users className="w-4 h-4" /> User Management
+              </Button>
+              <Button
+                variant={activeAdminTab === 'analytics' ? 'secondary' : 'ghost'}
+                className={cn(
+                  "w-full justify-start gap-3 h-10 text-sm font-medium rounded-lg", 
+                  activeAdminTab === 'analytics' 
+                    ? "bg-indigo-500/10 text-indigo-400 shadow-sm hover:bg-indigo-500/10" 
+                    : "text-slate-400 hover:bg-slate-800 hover:text-white hover:border-transparent"
+                )}
+                onClick={() => onSelectAdminTab('analytics')}
+              >
+                <History className="w-4 h-4" /> Analytics
+              </Button>
               <Button
                 variant={activeAdminTab === 'knowledge' ? 'secondary' : 'ghost'}
                 className={cn(
@@ -206,25 +230,25 @@ export function Sidebar({
         )}
         </div>
 
-        <div className={cn("p-6 border-t", userRole === 'Admin' ? "border-neutral-800 bg-[#1e293b]" : "border-neutral-100 bg-[#F0F4F9]")}>
+        <div className={cn("p-6 border-t", userRole === 'SuperManager' ? "border-neutral-800 bg-[#1e293b]" : "border-neutral-100 bg-[#F0F4F9]")}>
           <div className="flex items-center justify-between mb-3">
-            <h2 className={cn("text-xs font-semibold uppercase tracking-wider flex items-center gap-2", userRole === 'Admin' ? "text-slate-500" : "text-neutral-500")}>
+            <h2 className={cn("text-xs font-semibold uppercase tracking-wider flex items-center gap-2", userRole === 'SuperManager' ? "text-slate-500" : "text-neutral-500")}>
               <Shield className="w-4 h-4" /> Profile
             </h2>
-            <Button variant="ghost" size="sm" onClick={onLogout} className={cn("h-8 px-2 hover:border-transparent", userRole === 'Admin' ? "text-red-400 hover:text-red-300 hover:bg-red-950/30" : "text-red-600 hover:text-red-700 hover:bg-red-50")}>
+            <Button variant="ghost" size="sm" onClick={onLogout} className={cn("h-8 px-2 hover:border-transparent", userRole === 'SuperManager' ? "text-red-400 hover:text-red-300 hover:bg-red-950/30" : "text-red-600 hover:text-red-700 hover:bg-red-50")}>
               <LogOut className="w-3.5 h-3.5 mr-1" /> Sign Out
             </Button>
           </div>
-          <div className={cn("border shadow-sm rounded-xl p-3 flex items-center gap-3", userRole === 'Admin' ? "bg-slate-800/50 border-slate-700/50" : "bg-white border-neutral-200")}>
+          <div className={cn("border shadow-sm rounded-xl p-3 flex items-center gap-3", userRole === 'SuperManager' ? "bg-slate-800/50 border-slate-700/50" : "bg-white border-neutral-200")}>
             <div className={cn(
               "w-9 h-9 rounded-full flex items-center justify-center font-bold text-sm",
-              userRole === 'Admin' ? 'bg-red-500/20 text-red-400' : userRole === 'Employee' ? 'bg-indigo-100 text-indigo-600' : 'bg-green-100 text-green-600'
+              userRole === 'SuperManager' ? 'bg-red-500/20 text-red-400' : userRole === 'Employee' ? 'bg-indigo-100 text-indigo-600' : userRole === 'Lead' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
             )}>
               {currentUser?.name?.charAt(0).toUpperCase() || <UserIcon className="w-4 h-4" />}
             </div>
             <div className="min-w-0 flex-1">
-              <div className={cn("text-sm font-bold truncate leading-tight", userRole === 'Admin' ? "text-white" : "text-neutral-900")}>{currentUser?.name || 'Guest User'}</div>
-              <div className={cn("text-[11px] font-medium tracking-wide mt-0.5", userRole === 'Admin' ? "text-slate-400" : "text-neutral-500")}>{userRole} Account</div>
+              <div className={cn("text-sm font-bold truncate leading-tight", userRole === 'SuperManager' ? "text-white" : "text-neutral-900")}>{currentUser?.name || ''}</div>
+              <div className={cn("text-[11px] font-medium tracking-wide mt-0.5", userRole === 'SuperManager' ? "text-slate-400" : "text-neutral-500")}>{userRole} Account</div>
             </div>
           </div>
         </div>

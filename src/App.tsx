@@ -13,6 +13,7 @@ import { DataAnalytics } from './components/admin/DataAnalytics';
 import { ImportData } from './components/admin/ImportData';
 
 import { KnowledgeBase } from './components/KnowledgeBase';
+import { apiUrl } from './lib/api';
 
 const queryClient = new QueryClient();
 
@@ -38,14 +39,23 @@ function AppContent() {
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
 
   const { data: sessions = [], refetch: refetchSessions } = useSessions(currentUser?.id);
-  const { data: dbUsers = [] } = useAdminUsers(userRole === 'Admin' && isLoggedIn);
-  const { data: dbAnalytics = [] } = useAdminAnalytics(userRole === 'Admin' && isLoggedIn);
+  const { data: dbUsers = [], refetch: refetchAdminUsers } = useAdminUsers(userRole === 'SuperManager' && isLoggedIn);
+  const { data: dbAnalytics = [] } = useAdminAnalytics(userRole === 'SuperManager' && isLoggedIn);
+
+  const normalizeRole = (r: any): Role => {
+    const s = String(r || '').trim();
+    const k = s.toLowerCase().replace(/[\s_]+/g, '');
+    if (k === 'admin' || k === 'supermanager') return 'SuperManager';
+    if (k === 'manager') return 'Manager';
+    if (k === 'lead') return 'Lead';
+    return 'Employee';
+  };
 
   // Fetch documents from API
   const fetchDocuments = async () => {
     setIsLoadingDocs(true);
     try {
-      const response = await fetch('http://localhost:3005/api/admin/documents');
+      const response = await fetch(apiUrl('/admin/documents'));
       const data = await response.json();
       if (data.success && data.documents) {
         setDocuments(data.documents);
@@ -86,7 +96,7 @@ function AppContent() {
     if (savedUser) {
       const user = JSON.parse(savedUser);
       setCurrentUser(user);
-      setUserRole(user.role);
+      setUserRole(normalizeRole(user.role));
       setIsLoggedIn(true);
     }
   }, []);
@@ -94,7 +104,7 @@ function AppContent() {
   const createNewSession = async (title?: string) => {
     if (!currentUser) return;
     try {
-      const response = await fetch('http://localhost:3005/api/sessions', {
+      const response = await fetch(apiUrl('/sessions'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: currentUser.id, title: title || `New Chat ${sessions.length + 1}` })
@@ -112,7 +122,7 @@ function AppContent() {
 
   const handleDeleteSession = async (sessionId: string) => {
     try {
-      const response = await fetch(`http://localhost:3005/api/sessions/${sessionId}`, {
+      const response = await fetch(apiUrl(`/sessions/${sessionId}`), {
         method: 'DELETE'
       });
       if (response.ok) {
@@ -129,7 +139,7 @@ function AppContent() {
 
   const handleUpdateSessionTitle = async (sessionId: string, title: string) => {
     try {
-      const response = await fetch(`http://localhost:3005/api/sessions/${sessionId}`, {
+      const response = await fetch(apiUrl(`/sessions/${sessionId}`), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title })
@@ -143,7 +153,7 @@ function AppContent() {
   };
   const loadSessionMessages = async (sessionId: string) => {
     try {
-      const response = await fetch(`http://localhost:3005/api/sessions/${sessionId}/messages`);
+      const response = await fetch(apiUrl(`/sessions/${sessionId}/messages`));
       const data = await response.json();
       if (data.success) {
         setMessages(data.messages);
@@ -161,7 +171,7 @@ function AppContent() {
   };
 
   const handleAnalyzeGaps = async (queries: string[]) => {
-    const response = await fetch('http://localhost:3005/api/admin/analyze_gaps', {
+    const response = await fetch(apiUrl('/admin/analyze_gaps'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ queries })
@@ -178,7 +188,7 @@ function AppContent() {
     setIsAuthenticating(true);
     const endpoint = authMode === 'login' ? '/api/login' : '/api/register';
     try {
-      const response = await fetch(`http://localhost:3005${endpoint}`, {
+      const response = await fetch(apiUrl(endpoint.replace(/^\/api/, '')), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(authForm)
@@ -191,11 +201,11 @@ function AppContent() {
           setAuthForm(prev => ({ ...prev, password: '' }));
         } else {
           setCurrentUser(data.user);
-          setUserRole(data.user.role);
-          if (data.user.role !== 'Guest') localStorage.setItem('rag_user', JSON.stringify(data.user));
+          setUserRole(normalizeRole(data.user.role));
+          localStorage.setItem('rag_user', JSON.stringify(data.user));
           setIsLoggedIn(true);
           
-          if (data.user.role === 'Admin') {
+          if (normalizeRole(data.user.role) === 'SuperManager') {
             setActiveAdminTab('knowledge');
           } else {
             setActiveAdminTab(null);
@@ -211,17 +221,16 @@ function AppContent() {
     }
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isProcessing) return;
-    const query = input.trim();
+  const sendMessage = async (query: string) => {
+    if (!query.trim() || isProcessing) return;
+    const text = query.trim();
     setInput('');
-    const tempUserMsg: Message = { id: Date.now().toString(), sessionId: currentSessionId || '', role: 'user', content: query, createdAt: Date.now() };
+    const tempUserMsg: Message = { id: Date.now().toString(), sessionId: currentSessionId || '', role: 'user', content: text, createdAt: Date.now() };
     setMessages(prev => [...prev, tempUserMsg]);
     setIsProcessing(true);
 
     let sessionId = currentSessionId;
-    if (!sessionId && currentUser && userRole !== 'Guest') {
+    if (!sessionId && currentUser) {
       sessionId = await createNewSession(query.substring(0, 30) + '...');
     }
 
@@ -231,18 +240,18 @@ function AppContent() {
 
     try {
       if (sessionId) {
-        await fetch('http://localhost:3005/api/messages', {
+        await fetch(apiUrl('/messages'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId, role: 'user', content: query })
+          body: JSON.stringify({ sessionId, role: 'user', content: text })
         });
       }
 
-      const chatRes = await fetch('http://localhost:3005/api/chat', {
+      const chatRes = await fetch(apiUrl('/chat'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: query,
+          message: text,
           userId: currentUser?.id || null,
           userRole,
           sessionId: sessionId || null,
@@ -359,9 +368,15 @@ function AppContent() {
     }
   };
 
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isProcessing) return;
+    await sendMessage(input.trim());
+  };
+
   const handleDeleteDocument = async (id: string) => {
     try {
-      const response = await fetch(`http://localhost:3005/api/admin/documents/${id}`, {
+      const response = await fetch(apiUrl(`/admin/documents/${id}`), {
         method: 'DELETE'
       });
       const data = await response.json();
@@ -394,7 +409,6 @@ function AppContent() {
           setAuthSuccess(null);
         }}
         onUserRoleChange={setUserRole}
-        onContinueAsGuest={() => { setUserRole('Guest'); setIsLoggedIn(true); }}
         handleAuth={handleAuth}
         authForm={authForm}
         onAuthFormChange={setAuthForm}
@@ -446,7 +460,7 @@ function AppContent() {
       
       {activeAdminTab === 'users' ? (
         <div className="flex-1 overflow-hidden">
-            <UserManagement users={dbUsers} />
+            <UserManagement users={dbUsers} onRefresh={refetchAdminUsers} />
         </div>
       ) : activeAdminTab === 'analytics' ? (
         <div className="flex-1 overflow-hidden">
@@ -465,7 +479,7 @@ function AppContent() {
             onEditDocument={handleEditDocument}
           />
         </div>
-      ) : userRole !== 'Admin' ? (
+      ) : userRole !== 'SuperManager' ? (
         <ChatArea
           isSidebarOpen={isSidebarOpen}
           onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
@@ -474,6 +488,7 @@ function AppContent() {
           input={input}
           onInputChange={setInput}
           onSendMessage={handleSendMessage}
+          onSendText={(text) => sendMessage(text)}
           userRole={userRole}
           sessionTitle={sessions.find(s => s.id === currentSessionId)?.title}
         />

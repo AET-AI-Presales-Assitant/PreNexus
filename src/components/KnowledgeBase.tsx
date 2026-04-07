@@ -1,6 +1,6 @@
 import { useState, MouseEvent } from 'react';
 import { Document, RoleLevels, Role } from '../lib/vectorStore';
-import { Book, Code, Briefcase, CheckSquare, Search, FileText, Calendar, MoreVertical, Edit2, Trash2, X } from 'lucide-react';
+import { Book, Code, Briefcase, CheckSquare, Search, FileText, Calendar, MoreVertical, Edit2, Trash2, X, SlidersHorizontal, ChevronDown } from 'lucide-react';
 import { Input } from './ui/input';
 import { Button } from './ui/button';
 import {
@@ -47,33 +47,105 @@ const KNOWLEDGE_TYPES = [
 export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDocument }: KnowledgeBaseProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedType, setSelectedType] = useState<string | null>(null);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [sourceFilter, setSourceFilter] = useState<string>('');
+  const [tagFilter, setTagFilter] = useState<string>('');
+  const [dateFrom, setDateFrom] = useState<string>('');
+  const [dateTo, setDateTo] = useState<string>('');
+  const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'relevance'>('newest');
   const [selectedDoc, setSelectedDoc] = useState<Document | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState({ title: '', content: '' });
 
-  // Filter documents by Role RBAC and Search Term
-  const accessibleDocs = documents.filter(doc => {
-    const hasAccess = RoleLevels[userRole] >= RoleLevels[doc.role];
-    const matchesSearch = doc.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
-                          doc.content.toLowerCase().includes(searchTerm.toLowerCase());
-    return hasAccess && matchesSearch;
+  const normalize = (text: string) => {
+    const t = (text || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+    return t.replace(/[^a-z0-9]+/g, ' ').trim();
+  };
+
+  const tokenize = (text: string) => normalize(text).split(' ').filter(Boolean);
+
+  const getTypeId = (doc: Document) => (doc.topic && KNOWLEDGE_TYPES.find(t => t.id === doc.topic) ? doc.topic : 'General');
+
+  const getDocTags = (doc: Document) => {
+    const raw = Array.isArray(doc.tags) ? doc.tags : [];
+    const cleaned = raw.map(t => String(t || '').trim()).filter(Boolean);
+    if (cleaned.length > 0) return cleaned.map(t => (t.startsWith('#') ? t : `#${t}`));
+    return (doc.content.match(/#\w+/g) || []).slice(0, 12);
+  };
+
+  const parseDateToMs = (s: string, endOfDay: boolean) => {
+    if (!s) return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (!m) return null;
+    const y = Number(m[1]);
+    const mo = Number(m[2]) - 1;
+    const d = Number(m[3]);
+    const dt = endOfDay ? new Date(y, mo, d, 23, 59, 59, 999) : new Date(y, mo, d, 0, 0, 0, 0);
+    return dt.getTime();
+  };
+
+  const queryTokens = tokenize(searchTerm);
+  const sourceNeedle = normalize(sourceFilter);
+  const tagNeedle = normalize(tagFilter);
+  const fromMs = parseDateToMs(dateFrom, false);
+  const toMs = parseDateToMs(dateTo, true);
+
+  const accessibleDocs = documents.filter(doc => RoleLevels[userRole] >= RoleLevels[doc.role]);
+
+  const filteredDocs = accessibleDocs.filter(doc => {
+    const typeId = getTypeId(doc);
+    if (selectedType && typeId !== selectedType) return false;
+    if (sourceNeedle) {
+      const src = normalize(doc.source || '');
+      if (!src.includes(sourceNeedle)) return false;
+    }
+    if (tagNeedle) {
+      const tags = getDocTags(doc).map(t => normalize(t));
+      if (!tags.some(t => t.includes(tagNeedle))) return false;
+    }
+    if (fromMs !== null || toMs !== null) {
+      const ts = typeof doc.createdAt === 'number' ? doc.createdAt : 0;
+      if (fromMs !== null && ts < fromMs) return false;
+      if (toMs !== null && ts > toMs) return false;
+    }
+    if (queryTokens.length > 0) {
+      const hay = tokenize(`${doc.title} ${doc.content} ${(doc.source || '')} ${getDocTags(doc).join(' ')} ${typeId} ${doc.role}`);
+      const haySet = new Set(hay);
+      const overlap = queryTokens.reduce((n, t) => n + (haySet.has(t) ? 1 : 0), 0);
+      if (overlap === 0) return false;
+    }
+    return true;
   });
 
-  // Group by topic
-  const groupedDocs = accessibleDocs.reduce((acc, doc) => {
-    const topic = doc.topic || 'General';
-    // Map custom topics to 'General' if they don't match the 3 main types exactly
-    const matchedType = KNOWLEDGE_TYPES.find(t => t.id === topic) ? topic : 'General';
-    
-    if (!acc[matchedType]) acc[matchedType] = [];
-    acc[matchedType].push(doc);
-    return acc;
-  }, {} as Record<string, Document[]>);
+  const relevanceScore = (doc: Document) => {
+    if (queryTokens.length === 0) return 0;
+    const typeId = getTypeId(doc);
+    const titleN = normalize(doc.title);
+    const contentN = normalize(doc.content);
+    const srcN = normalize(doc.source || '');
+    const tagsN = normalize(getDocTags(doc).join(' '));
+    const hayTokens = tokenize(`${titleN} ${tagsN} ${srcN} ${typeId} ${contentN}`);
+    const haySet = new Set(hayTokens);
+    const overlap = queryTokens.reduce((n, t) => n + (haySet.has(t) ? 1 : 0), 0);
+    const phraseBoost = normalize(searchTerm) && (titleN.includes(normalize(searchTerm)) ? 3 : 0);
+    const tagBoost = queryTokens.some(t => tagsN.includes(t)) ? 1 : 0;
+    return overlap + phraseBoost + tagBoost;
+  };
 
-  // Flat list of documents instead of grouped sections
-  const displayDocs = selectedType 
-    ? accessibleDocs.filter(doc => (doc.topic === selectedType) || (!KNOWLEDGE_TYPES.find(t=>t.id===doc.topic) && selectedType === 'General'))
-    : accessibleDocs;
+  const displayDocs = filteredDocs.slice().sort((a, b) => {
+    if (sortBy === 'newest') return (b.createdAt || 0) - (a.createdAt || 0);
+    if (sortBy === 'oldest') return (a.createdAt || 0) - (b.createdAt || 0);
+    const sa = relevanceScore(a);
+    const sb = relevanceScore(b);
+    if (sb !== sa) return sb - sa;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
+
+  const countsByType = accessibleDocs.reduce((acc, doc) => {
+    const typeId = getTypeId(doc);
+    acc[typeId] = (acc[typeId] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
 
   const handleEditClick = (doc: Document, e: MouseEvent) => {
     e.stopPropagation();
@@ -99,42 +171,41 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
     }
   };
 
-  // Helper to extract tags (simple regex for words starting with #, or just make some up for UI)
-  const getTags = (content: string) => {
-    const tags = content.match(/#\w+/g) || [];
-    if (tags.length > 0) return tags;
-    // Mock tags for visual parity with screenshot if none exist
-    return ['#cloud', '#migration', '#aws']; 
-  };
-
   // Helper to format date
   const formatDate = (timestamp?: number) => {
     if (!timestamp) return '—';
     return new Date(timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
   };
 
+  const clearAllFilters = () => {
+    setSearchTerm('');
+    setSelectedType(null);
+    setSourceFilter('');
+    setTagFilter('');
+    setDateFrom('');
+    setDateTo('');
+    setSortBy('newest');
+  };
+
+  const canClearAll = Boolean(
+    searchTerm.trim() ||
+    selectedType !== null ||
+    sourceFilter.trim() ||
+    tagFilter.trim() ||
+    dateFrom ||
+    dateTo ||
+    sortBy !== 'newest'
+  );
+
   return (
     <div className="flex flex-col h-full bg-neutral-50 overflow-hidden">
       <header className="px-8 py-6 bg-white border-b border-neutral-200 shrink-0">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-bold text-neutral-900 flex items-center gap-2">
-              <Book className="w-6 h-6 text-indigo-600" />
-              Knowledge Base
-            </h1>
-            <p className="text-neutral-500 mt-1">Browse internal capabilities, case studies, and workflows.</p>
-          </div>
-          
-          <div className="relative w-full md:w-72">
-            <Input 
-              type="text"
-              placeholder="Search knowledge..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="pl-10 h-10 bg-neutral-100 border-transparent focus:bg-white"
-            />
-            <Search className="w-4 h-4 text-neutral-400 absolute left-3.5 top-3" />
-          </div>
+        <div>
+          <h1 className="text-2xl font-bold text-neutral-900 flex items-center gap-2">
+            <Book className="w-6 h-6 text-indigo-600" />
+            Knowledge Base
+          </h1>
+          <p className="text-neutral-500 mt-1">Browse internal capabilities, case studies, and workflows.</p>
         </div>
 
         {/* Filters */}
@@ -150,7 +221,7 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
             All Knowledge
           </button>
           {KNOWLEDGE_TYPES.map(type => {
-            const count = groupedDocs[type.id]?.length || 0;
+            const count = countsByType[type.id] || 0;
             if (count === 0 && selectedType !== type.id) return null;
             
             return (
@@ -169,6 +240,92 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
             )
           })}
         </div>
+
+        <div className="mt-4">
+          <div className="flex flex-col md:flex-row gap-3 items-stretch">
+            <div className="relative flex-1">
+              <Input
+                type="text"
+                placeholder="Search knowledge..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="pl-10 h-10 bg-white focus:bg-white"
+              />
+              <Search className="w-4 h-4 text-neutral-400 absolute left-3.5 top-3" />
+            </div>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="h-10 px-3 flex items-center justify-center gap-2"
+                onClick={() => setFiltersOpen(v => !v)}
+              >
+                <SlidersHorizontal className="w-4 h-4" />
+                Filters
+                <ChevronDown className={`w-4 h-4 transition-transform ${filtersOpen ? 'rotate-180' : ''}`} />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                className="h-10 px-3 text-sm text-neutral-600 hover:text-neutral-900 disabled:opacity-50 disabled:pointer-events-none"
+                disabled={!canClearAll}
+                onClick={clearAllFilters}
+              >
+                Clear all
+              </Button>
+            </div>
+          </div>
+
+          {filtersOpen && (
+            <div className="mt-3 flex flex-wrap gap-3 items-center">
+              <div className="min-w-[220px] flex-1">
+                <Input
+                  type="text"
+                  placeholder="Filter by source file..."
+                  value={sourceFilter}
+                  onChange={(e) => setSourceFilter(e.target.value)}
+                  className="h-10 bg-white"
+                />
+              </div>
+              <div className="min-w-[180px] flex-1">
+                <Input
+                  type="text"
+                  placeholder="Filter by tag..."
+                  value={tagFilter}
+                  onChange={(e) => setTagFilter(e.target.value)}
+                  className="h-10 bg-white"
+                />
+              </div>
+              <div className="min-w-[170px]">
+                <Input
+                  type="date"
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value)}
+                  className="h-10 bg-white"
+                />
+              </div>
+              <div className="min-w-[170px]">
+                <Input
+                  type="date"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value)}
+                  className="h-10 bg-white"
+                />
+              </div>
+              <div className="min-w-[190px]">
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as any)}
+                  className="w-full h-10 bg-white border border-neutral-200 rounded-lg px-3 text-sm text-neutral-700"
+                >
+                  <option value="newest">Newest</option>
+                  <option value="oldest">Oldest</option>
+                  <option value="relevance">Relevance</option>
+                </select>
+              </div>
+            </div>
+          )}
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto p-8">
@@ -184,7 +341,8 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {displayDocs.map(doc => {
-                const typeId = doc.topic && KNOWLEDGE_TYPES.find(t=>t.id===doc.topic) ? doc.topic : 'General';
+                const typeId = getTypeId(doc);
+                const tags = getDocTags(doc);
                 return (
                 <div 
                   key={doc.id} 
@@ -204,7 +362,7 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
                        typeId === 'presales' ? 'Workflow' : 'General'}
                     </span>
                     
-                    {userRole === 'Admin' && (
+                    {userRole === 'SuperManager' && (
                       <div className="opacity-0 group-hover:opacity-100 transition-opacity">
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
@@ -240,14 +398,14 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
 
                   {/* Tags */}
                   <div className="flex flex-wrap gap-2 mb-6">
-                    {getTags(doc.content).slice(0, 3).map((tag, i) => (
+                    {tags.slice(0, 3).map((tag, i) => (
                       <span key={i} className="text-[11px] bg-neutral-100 text-neutral-600 px-2 py-1 rounded-md">
                         {tag}
                       </span>
                     ))}
-                    {getTags(doc.content).length > 3 && (
+                    {tags.length > 3 && (
                       <span className="text-[11px] bg-neutral-50 text-neutral-500 px-2 py-1 rounded-md border border-neutral-100">
-                        +{getTags(doc.content).length - 3} more
+                        +{tags.length - 3} more
                       </span>
                     )}
                   </div>
@@ -281,7 +439,7 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
                 {selectedDoc.topic || 'General'}
               </span>
               <div className="flex items-center gap-2">
-                {userRole === 'Admin' && (
+                {userRole === 'SuperManager' && (
                   <>
                     <Button variant="ghost" size="icon" onClick={(e) => handleEditClick(selectedDoc, e)}>
                       <Edit2 className="w-4 h-4 text-neutral-500" />
@@ -301,7 +459,7 @@ export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDoc
             <div className="p-8 overflow-y-auto flex-1">
               <h2 className="text-2xl font-bold text-neutral-900 mb-4">{selectedDoc.title}</h2>
               <div className="flex flex-wrap gap-2 mb-8">
-                {getTags(selectedDoc.content).map((tag, i) => (
+                {getDocTags(selectedDoc).map((tag, i) => (
                   <span key={i} className="text-[12px] bg-neutral-100 text-neutral-600 px-2 py-1 rounded-md">
                     {tag}
                   </span>

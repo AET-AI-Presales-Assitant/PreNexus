@@ -20,7 +20,6 @@ interface AuthScreenProps {
   userRole: Role;
   onAuthModeChange: (mode: 'select' | 'login' | 'register') => void;
   onUserRoleChange: (role: Role) => void;
-  onContinueAsGuest: () => void;
   handleAuth: (e: FormEvent) => void;
   authForm: any;
   onAuthFormChange: (form: any) => void;
@@ -34,7 +33,6 @@ export function AuthScreen({
   userRole,
   onAuthModeChange,
   onUserRoleChange,
-  onContinueAsGuest,
   handleAuth,
   authForm,
   onAuthFormChange,
@@ -111,32 +109,12 @@ export function AuthScreen({
                         <ArrowRight className='w-5 h-5 text-neutral-300 group-hover:text-indigo-600 ml-auto transition-colors' />
                       </div>
                     </button>
-
-                    <button
-                      onClick={onContinueAsGuest}
-                      className='w-full p-4 rounded-2xl bg-white border-2 border-neutral-100 hover:border-green-600 hover:bg-green-50/50 transition-all group text-left shadow-sm hover:shadow-md relative overflow-hidden'
-                    >
-                      <div className='flex items-center gap-4 relative z-10'>
-                        <div className='w-12 h-12 bg-green-100 text-green-600 rounded-xl flex items-center justify-center group-hover:scale-110 transition-transform'>
-                          <UserIcon className='w-6 h-6' />
-                        </div>
-                        <div>
-                          <div className='font-bold text-neutral-900 group-hover:text-green-700 transition-colors'>
-                            Continue as Guest
-                          </div>
-                          <div className='text-xs text-neutral-500 mt-1'>
-                            Public information access only
-                          </div>
-                        </div>
-                        <ArrowRight className='w-5 h-5 text-neutral-300 group-hover:text-green-600 ml-auto transition-colors' />
-                      </div>
-                    </button>
                   </div>
                   <div className='pt-8 text-center'>
                     <button
                       onClick={() => {
                         onAuthModeChange('login');
-                        onUserRoleChange('Admin');
+                        onUserRoleChange('SuperManager');
                       }}
                       className='text-xs font-medium text-neutral-400 hover:text-indigo-600 transition-colors py-2 px-4 rounded-full hover:bg-indigo-50'
                     >
@@ -161,14 +139,14 @@ export function AuthScreen({
                       selection
                     </button>
                     <h2 className='text-2xl font-bold text-neutral-900'>
-                      {userRole === 'Admin'
+                      {userRole === 'SuperManager'
                         ? 'Admin Portal'
                         : authMode === 'login'
                           ? 'Sign In'
                           : 'Create Account'}
                     </h2>
                     <p className='text-neutral-500 mt-2'>
-                      {userRole === 'Admin'
+                      {userRole === 'SuperManager'
                         ? 'Secure access for system administrators'
                         : authMode === 'login'
                           ? 'Enter your credentials to access your account'

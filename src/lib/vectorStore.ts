@@ -1,6 +1,8 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-export type Role = 'Guest' | 'Employee' | 'Admin';
+export type Role = 'Employee' | 'Lead' | 'Manager' | 'SuperManager';
+
+export const Roles: Role[] = ['Employee', 'Lead', 'Manager', 'SuperManager'];
 
 export type KnowledgeType = 
   | 'Skills, capabilities, Tech stack, solution' 
@@ -8,9 +10,10 @@ export type KnowledgeType =
   | 'Presale checklist or workflow';
 
 export const RoleLevels: Record<Role, number> = {
-  Guest: 1,
-  Employee: 2,
-  Admin: 3,
+  Employee: 1,
+  Lead: 2,
+  Manager: 3,
+  SuperManager: 4,
 };
 
 export interface Document {
@@ -21,6 +24,8 @@ export interface Document {
   topic?: KnowledgeType | string;
   embedding?: number[];
   createdAt?: number;
+  source?: string;
+  tags?: string[];
 }
 
 export async function getEmbedding(text: string, ai: GoogleGenerativeAI): Promise<number[]> {

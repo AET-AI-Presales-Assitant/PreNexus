@@ -18,6 +18,53 @@ import json
 import re
 import unicodedata
 import time
+import random
+
+try:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+except Exception:
+    RecursiveCharacterTextSplitter = None
+
+class _ThrottledEmbeddings:
+    def __init__(self, inner, batch_size: int = 8, max_retries: int = 5, base_sleep_s: float = 1.0):
+        self.inner = inner
+        self.batch_size = max(1, int(batch_size))
+        self.max_retries = max(0, int(max_retries))
+        self.base_sleep_s = float(base_sleep_s)
+
+    def _is_retryable(self, e: Exception) -> bool:
+        msg = str(e or "")
+        m = msg.lower()
+        return ("resource_exhausted" in m) or ("429" in m) or ("rate limit" in m) or ("quota" in m)
+
+    def _sleep(self, attempt: int):
+        if self.base_sleep_s <= 0:
+            return
+        jitter = random.random() * 0.25
+        time.sleep(self.base_sleep_s * (2 ** max(0, attempt - 1)) + jitter)
+
+    def _call_with_retry(self, fn):
+        last = None
+        for attempt in range(0, self.max_retries + 1):
+            try:
+                return fn()
+            except Exception as e:
+                last = e
+                if attempt >= self.max_retries or not self._is_retryable(e):
+                    raise
+                self._sleep(attempt + 1)
+        raise last  # type: ignore[misc]
+
+    def embed_documents(self, texts: List[str]):
+        out = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i + self.batch_size]
+            res = self._call_with_retry(lambda: self.inner.embed_documents(batch))
+            out.extend(res)
+        return out
+
+    def embed_query(self, text: str):
+        return self._call_with_retry(lambda: self.inner.embed_query(text))
 
 def _coerce_vision_content_to_text(content: Any) -> str:
     """
@@ -269,16 +316,10 @@ class KnowledgePipeline:
     def __init__(self, api_key: str):
         os.environ["GOOGLE_API_KEY"] = api_key
         self.llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0)
-        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+        self.embeddings = _ThrottledEmbeddings(GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001"))
         
         self.vectorstore = Chroma(
             collection_name="presales_summaries",
-            embedding_function=self.embeddings,
-            persist_directory="./chroma_data"
-        )
-
-        self.chunkstore = Chroma(
-            collection_name="presales_chunks",
             embedding_function=self.embeddings,
             persist_directory="./chroma_data"
         )
@@ -292,19 +333,21 @@ class KnowledgePipeline:
             id_key=self.id_key,
         )
         
-        # Initialize Semantic Chunker (cut chunk by semantic meaning, not by length)
-        self.text_splitter = SemanticChunker(self.embeddings, breakpoint_threshold_type="percentile")
+        if RecursiveCharacterTextSplitter is not None:
+            self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=2400, chunk_overlap=250)
+        else:
+            self.text_splitter = SemanticChunker(self.embeddings, breakpoint_threshold_type="percentile")
 
-    def process_and_ingest(self, file_path: str, role: str = "Employee"):
+    def process_and_ingest(self, file_path: str, role: str = "Employee") -> dict:
         print(f"1. Reading file: {file_path}...")
         docs = load_file(file_path, self.llm)
         
         # Combine all page contents into one full text for better semantic chunking.
         full_text = "\n\n".join([d.page_content for d in docs])
         
-        print("2. Performing Semantic Chunking...")
+        print("2. Performing Chunking...")
         chunks = self.text_splitter.create_documents([full_text])
-        print(f"   -> Successfully split into {len(chunks)} semantic chunks.")
+        print(f"   -> Successfully split into {len(chunks)} chunks.")
         
         print("3. Extracting Metadata & Generating Summary with LLM...")
         structured_llm = self.llm.with_structured_output(ChunkClassification)
@@ -312,9 +355,8 @@ class KnowledgePipeline:
         doc_ids = [str(uuid.uuid4()) for _ in chunks]
         created_at_ms = int(time.time() * 1000)
         summary_docs = []
-        chunk_docs = []
         summary_ids = []
-        chunk_ids = []
+        errors = []
         
         for i, chunk in enumerate(chunks):
             try:
@@ -377,14 +419,9 @@ class KnowledgePipeline:
                 summary_docs.append(summary_doc)
                 summary_ids.append(doc_ids[i])
 
-                chunk_docs.append(Document(
-                    page_content=chunk.page_content,
-                    metadata=dict(chunk.metadata)
-                ))
-                chunk_ids.append(doc_ids[i])
-                
             except Exception as e:
                 print(f"   ! Error occurred while processing chunk {i+1}: {e}")
+                errors.append(str(e))
                 
         print("4. Saving to Multi-Vector Store (Chroma)...")
         # Lưu Full Text vào ByteStore
@@ -393,11 +430,20 @@ class KnowledgePipeline:
         # Lưu Summary vào Vector DB (Chroma)
         if summary_docs:
             self.vectorstore.add_documents(summary_docs, ids=summary_ids)
-
-        if chunk_docs:
-            self.chunkstore.add_documents(chunk_docs, ids=chunk_ids)
             
         print("Complete Ingestion!\n")
+        return {
+            "file_path": file_path,
+            "createdAt": created_at_ms,
+            "num_chunks_total": len(chunks),
+            "num_chunks_success": len(summary_ids),
+            "num_summary_docs": len(summary_ids),
+            "num_chunk_docs": 0,
+            "vector_ids": list(summary_ids),
+            "chunk_ids": [],
+            "errors": errors[:10],
+            "embedding_model": "models/gemini-embedding-001"
+        }
         
     def query(self, question: str) -> List[Document]:
         """Search for relevant documents based on the question."""
