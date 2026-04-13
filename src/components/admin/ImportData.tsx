@@ -1,12 +1,11 @@
-import React, { useState, useMemo, useEffect } from 'react';
-import { Upload, FileText, CheckCircle, AlertCircle, File, FolderOpen, Loader2, Clock, Check, X } from 'lucide-react';
+import React, { useState } from 'react';
+import { Upload, FileText, CheckCircle, AlertCircle, Loader2, Clock, Check, X } from 'lucide-react';
 import { Button } from '../ui/button';
-import { Role, Document } from '../../lib/vectorStore';
+import { Role } from '../../lib/vectorStore';
 import { apiUrl } from '../../lib/api';
 
 interface ImportDataProps {
   onImport: (title: string, content: string, role: Role, topic?: string) => Promise<void>;
-  existingDocs: Document[];
 }
 
 interface UploadProgress {
@@ -24,7 +23,7 @@ interface UploadProgress {
   errors?: string[];
 }
 
-export function ImportData({ onImport, existingDocs }: ImportDataProps) {
+export function ImportData({ onImport }: ImportDataProps) {
   const [activeTab, setActiveTab] = useState<'upload' | 'progress'>('upload');
   const [role, setRole] = useState<Role>('Employee');
   const [dragActive, setDragActive] = useState(false);
@@ -33,7 +32,7 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
   const refreshJob = async (jobId: string) => {
     const response = await fetch(apiUrl(`/admin/ingest_jobs/${jobId}`));
     const data = await response.json();
-    if (!data.success) throw new Error(data.message || 'Failed to fetch job');
+    if (!data.success) throw new Error(data?.error ? `${data.message || 'Failed to fetch job'}: ${data.error}` : (data.message || 'Failed to fetch job'));
     return data.job;
   };
 
@@ -93,7 +92,7 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
     if (!task.jobId) return;
     const response = await fetch(apiUrl(`/admin/ingest_jobs/${task.jobId}/retry`), { method: 'POST' });
     const data = await response.json();
-    if (!data.success) throw new Error(data.message || 'Retry failed');
+    if (!data.success) throw new Error(data?.error ? `${data.message || 'Retry failed'}: ${data.error}` : (data.message || 'Retry failed'));
     const job = data.job;
     setUploadTasks(prev => prev.map(t => t.file.name === task.file.name ? {
       ...t,
@@ -119,17 +118,6 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
     } : t));
     await onImport(task.file.name, "Rolled back", role, 'General');
   };
-
-  // Group docs by topic
-  const docsByTopic = useMemo(() => {
-    const grouped: Record<string, Document[]> = {};
-    existingDocs.forEach(doc => {
-      const topic = doc.topic || 'Uncategorized';
-      if (!grouped[topic]) grouped[topic] = [];
-      grouped[topic].push(doc);
-    });
-    return grouped;
-  }, [existingDocs]);
 
   const processFile = async (file: File) => {
     // Chuyển sang tab progress ngay lập tức
@@ -159,9 +147,10 @@ export function ImportData({ onImport, existingDocs }: ImportDataProps) {
         ));
         if (job?.id) startPolling(file.name, job.id);
       } else {
+        const errMsg = data?.error ? `${data.message || 'Failed to process file'}: ${data.error}` : (data.message || 'Failed to process file');
         setUploadTasks(prev => prev.map(task => 
           task.file.name === file.name 
-            ? { ...task, progress: 100, status: 'error', message: data.message || 'Failed to process file' }
+            ? { ...task, progress: 100, status: 'error', message: errMsg }
             : task
         ));
       }

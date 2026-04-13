@@ -7,6 +7,7 @@ pydantic
 # Database
 sqlalchemy
 psycopg2-binary
+python-dotenv
 
 # LangChain Ecosystem (Tương thích với nhau)
 langchain
@@ -16,6 +17,8 @@ langchain-classic
 langchain-experimental
 langchain-google-genai
 langchain-chroma
+tenacity
+langgraph
 
 # Document Parsers
 pypdf

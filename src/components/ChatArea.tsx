@@ -1,9 +1,8 @@
 import { motion } from 'motion/react';
-import { User, Bot, Loader2, Send, Menu, ChevronDown, ChevronRight, CheckCircle2, AlertCircle, CircleDashed, Info, ExternalLink } from 'lucide-react';
+import { User, Bot, Send, Menu, Info, ExternalLink } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Message } from '../types';
-import { Role } from '../lib/vectorStore';
 import { apiUrl } from '../lib/api';
 import { useEffect, useRef, FormEvent, useState } from 'react';
 import { Dialog, DialogContent } from './ui/dialog';
@@ -225,7 +224,6 @@ function ReasoningProtocol({ thoughts, isProcessing }: { thoughts: any[], isProc
 }
 
 interface ChatAreaProps {
-  isSidebarOpen: boolean;
   onToggleSidebar: () => void;
   messages: Message[];
   isProcessing: boolean;
@@ -233,12 +231,10 @@ interface ChatAreaProps {
   onInputChange: (value: string) => void;
   onSendMessage: (e: FormEvent) => void;
   onSendText: (text: string) => void;
-  userRole: Role;
   sessionTitle?: string;
 }
 
 export function ChatArea({
-  isSidebarOpen,
   onToggleSidebar,
   messages,
   isProcessing,
@@ -246,7 +242,6 @@ export function ChatArea({
   onInputChange,
   onSendMessage,
   onSendText,
-  userRole,
   sessionTitle
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -264,7 +259,10 @@ export function ChatArea({
     return (
       t.includes('không có dữ liệu nội bộ') ||
       t.includes('khong co du lieu noi bo') ||
+      t.includes('kiến thức liên quan tới chủ đề này sẽ được bổ sung trong thời gian ngắn') ||
+      t.includes('kien thuc lien quan toi chu de nay se duoc bo sung trong thoi gian ngan') ||
       t.includes('no internal data') ||
+      t.includes('relevant knowledge for this topic will be added shortly') ||
       t.includes('missing internal data')
     );
   };
@@ -342,8 +340,8 @@ export function ChatArea({
                   {msg.role === 'user' ? <User className="w-4 h-4 text-white" /> : <Bot className="w-4 h-4 text-indigo-600" />}
                 </div>
                 <div className="max-w-[85%] md:max-w-[75%]">
-                  {isProcessing && msg.role === 'agent' && i === lastAgentIndex && msg.thoughts && msg.thoughts.length > 0 && (
-                    <ReasoningProtocol thoughts={msg.thoughts} isProcessing={true} />
+                  {msg.role === 'agent' && msg.thoughts && msg.thoughts.length > 0 && (
+                    <ReasoningProtocol thoughts={msg.thoughts} isProcessing={isProcessing && i === lastAgentIndex} />
                   )}
                   <div className={`rounded-2xl px-5 py-3.5 text-sm shadow-sm ${
                     msg.role === 'user' 

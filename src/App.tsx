@@ -27,7 +27,7 @@ function AppContent() {
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
 
-  const [authMode, setAuthMode] = useState<'select' | 'login' | 'register'>('select');
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authForm, setAuthForm] = useState({ username: '', password: '', name: '' });
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccess, setAuthSuccess] = useState<string | null>(null);
@@ -36,7 +36,6 @@ function AppContent() {
   const [activeAdminTab, setActiveAdminTab] = useState<'users' | 'analytics' | 'import' | 'knowledge' | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth > 1024);
   const [documents, setDocuments] = useState<Document[]>([]);
-  const [isLoadingDocs, setIsLoadingDocs] = useState(false);
 
   const { data: sessions = [], refetch: refetchSessions } = useSessions(currentUser?.id);
   const { data: dbUsers = [], refetch: refetchAdminUsers } = useAdminUsers(userRole === 'SuperManager' && isLoggedIn);
@@ -53,7 +52,6 @@ function AppContent() {
 
   // Fetch documents from API
   const fetchDocuments = async () => {
-    setIsLoadingDocs(true);
     try {
       const response = await fetch(apiUrl('/admin/documents'));
       const data = await response.json();
@@ -62,8 +60,6 @@ function AppContent() {
       }
     } catch (error) {
       console.error('Failed to fetch documents:', error);
-    } finally {
-      setIsLoadingDocs(false);
     }
   };
 
@@ -165,7 +161,7 @@ function AppContent() {
     }
   };
 
-  const handleImportDocument = async (title: string, content: string, role: Role, topic?: string) => {
+  const handleImportDocument = async (_title: string, _content: string, _role: Role, _topic?: string) => {
     // Chỉ cần fetch lại documents từ server vì đã xử lý qua backend
     await fetchDocuments();
   };
@@ -187,11 +183,15 @@ function AppContent() {
     setAuthSuccess(null);
     setIsAuthenticating(true);
     const endpoint = authMode === 'login' ? '/api/login' : '/api/register';
+    const controller = new AbortController();
+    const timeoutMs = 15000;
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(apiUrl(endpoint.replace(/^\/api/, '')), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(authForm)
+        body: JSON.stringify(authForm),
+        signal: controller.signal,
       });
       const data = await response.json();
       if (data.success) {
@@ -215,8 +215,13 @@ function AppContent() {
         setAuthError(data.message || 'Authentication failed');
       }
     } catch (error) {
-      setAuthError('Server connection failed');
+      if ((error as any)?.name === 'AbortError') {
+        setAuthError('Request timed out. Please try again.');
+      } else {
+        setAuthError('Server connection failed');
+      }
     } finally {
+      window.clearTimeout(timeoutId);
       setIsAuthenticating(false);
     }
   };
@@ -259,6 +264,16 @@ function AppContent() {
           history: [...messages, tempUserMsg].map(m => ({ role: m.role, content: m.content }))
         })
       });
+
+      const contentType = chatRes.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = await chatRes.json().catch(() => null);
+        const msgText = (data?.message || data?.error || 'Error processing request.') as string;
+        setMessages(prev => prev.map(msg =>
+          msg.id === agentMsgId ? { ...msg, content: msgText } : msg
+        ));
+        return;
+      }
 
       if (!chatRes.body) throw new Error('No response body');
 
@@ -327,7 +342,7 @@ function AppContent() {
                     bufferedText += (data.content || '');
                   } else {
                     setMessages(prev => prev.map(msg => 
-                      msg.id === agentMsgId ? { ...msg, content: msg.content + data.content } : msg
+                      msg.id === agentMsgId ? { ...msg, content: msg.content + (data.content || '') } : msg
                     ));
                   }
                 } else if (data.type === 'clear') {
@@ -335,6 +350,17 @@ function AppContent() {
                   setMessages(prev => prev.map(msg => 
                     msg.id === agentMsgId ? { ...msg, content: '' } : msg
                   ));
+                } else if (data.type === 'answer_start') {
+                  if (!allowAnswer) {
+                    allowAnswer = true;
+                    if (bufferedText) {
+                      const toFlush = bufferedText;
+                      bufferedText = '';
+                      setMessages(prev => prev.map(msg =>
+                        msg.id === agentMsgId ? { ...msg, content: msg.content + toFlush } : msg
+                      ));
+                    }
+                  }
                 } else if (data.type === 'done') {
                   if (!allowAnswer && bufferedText) {
                     const toFlush = bufferedText;
@@ -401,14 +427,12 @@ function AppContent() {
     return (
       <AuthScreen
         authMode={authMode}
-        userRole={userRole}
         onAuthModeChange={(mode) => {
           setAuthMode(mode);
           setAuthForm({ username: '', password: '', name: '' });
           setAuthError(null);
           setAuthSuccess(null);
         }}
-        onUserRoleChange={setUserRole}
         handleAuth={handleAuth}
         authForm={authForm}
         onAuthFormChange={setAuthForm}
@@ -449,7 +473,7 @@ function AppContent() {
           localStorage.removeItem('rag_user'); 
           setMessages([]); 
           setCurrentSessionId(null); 
-          setAuthMode('select'); 
+          setAuthMode('login'); 
           setAuthForm({ username: '', password: '', name: '' });
           setAuthError(null);
           setAuthSuccess(null);
@@ -468,7 +492,7 @@ function AppContent() {
         </div>
       ) : activeAdminTab === 'import' ? (
         <div className="flex-1 overflow-hidden">
-            <ImportData onImport={handleImportDocument} existingDocs={documents} />
+            <ImportData onImport={handleImportDocument} />
         </div>
       ) : activeAdminTab === 'knowledge' ? (
         <div className="flex-1 overflow-hidden">
@@ -481,7 +505,6 @@ function AppContent() {
         </div>
       ) : userRole !== 'SuperManager' ? (
         <ChatArea
-          isSidebarOpen={isSidebarOpen}
           onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
           messages={messages}
           isProcessing={isProcessing}
@@ -489,7 +512,6 @@ function AppContent() {
           onInputChange={setInput}
           onSendMessage={handleSendMessage}
           onSendText={(text) => sendMessage(text)}
-          userRole={userRole}
           sessionTitle={sessions.find(s => s.id === currentSessionId)?.title}
         />
       ) : (

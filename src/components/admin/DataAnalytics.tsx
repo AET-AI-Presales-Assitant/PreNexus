@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { AnalyticsQuery } from '../../types';
-import { BarChart, Search, Sparkles, TrendingUp, Users, Calendar, AlertCircle, BookOpen, Lightbulb } from 'lucide-react';
+import { BarChart, Sparkles, AlertCircle, BookOpen, Lightbulb } from 'lucide-react';
 import { Button } from '../ui/button';
 
 interface DataAnalyticsProps {

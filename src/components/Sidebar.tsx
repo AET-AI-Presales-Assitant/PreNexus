@@ -1,4 +1,4 @@
-import { Plus, History, MessageSquare, Shield, Users, Settings, LogOut, User as UserIcon, Lock, Bot, X, Database, MoreVertical, Edit2, Trash2, Book } from 'lucide-react';
+import { History, MessageSquare, Shield, Users, LogOut, User as UserIcon, Bot, X, Database, MoreVertical, Edit2, Trash2, Book } from 'lucide-react';
 import { Button } from './ui/button';
 import { User, Session } from '../types';
 import { Role } from '../lib/vectorStore';
@@ -86,7 +86,7 @@ export function Sidebar({
         </div>
 
         <div className="p-6 flex-1 overflow-y-auto space-y-8 custom-scrollbar">
-          {userRole === 'Employee' && (
+          {userRole !== 'SuperManager' && (
           <section>
             <Button 
               onClick={onNewConversation} 
@@ -157,7 +157,7 @@ export function Sidebar({
         )}
 
         {/* Chat history */}
-        {userRole === 'Employee' && sessions.length > 0 && (
+        {userRole !== 'SuperManager' && sessions.length > 0 && (
           <section className="space-y-4 flex flex-col h-full overflow-hidden">
             <h2 className="text-xs font-bold text-neutral-500 uppercase tracking-wider pl-2 shrink-0">
               Recent Chats

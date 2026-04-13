@@ -40,6 +40,31 @@ class Message(Base):
 
     session = relationship("Session", back_populates="messages")
 
+class SessionMemory(Base):
+    __tablename__ = "session_memories"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column("session_id", UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=False, unique=True)
+    summary = Column(Text, nullable=False, default="")
+    last_message_id = Column("last_message_id", UUID(as_uuid=True), nullable=True)
+    updated_at = Column("updated_at", DateTime, default=datetime.utcnow, nullable=False)
+
+    session = relationship("Session")
+
+class UserMemory(Base):
+    __tablename__ = "user_memories"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column("user_id", UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    session_id = Column("session_id", UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True)
+    kind = Column(String(64), nullable=False, default="session_summary")
+    content = Column(Text, nullable=False, default="")
+    updated_at = Column("updated_at", DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column("created_at", DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User")
+    session = relationship("Session")
+
 class IngestJob(Base):
     __tablename__ = "ingest_jobs"
 
