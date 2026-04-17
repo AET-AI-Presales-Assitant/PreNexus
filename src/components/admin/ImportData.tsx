@@ -400,7 +400,7 @@ export function ImportData({ onImport }: ImportDataProps) {
                   {task.errors && task.errors.length > 0 && (
                     <div className="mt-2 text-xs text-neutral-600 bg-neutral-50 border border-neutral-200 rounded-lg p-3 whitespace-pre-wrap">
                       {task.errors.slice(0, 5).map((e, idx) => (
-                        <div key={idx}>- {e}</div>
+                        <div key={idx}>- {typeof e === 'object' ? JSON.stringify(e) : String(e)}</div>
                       ))}
                     </div>
                   )}

@@ -21,5 +21,7 @@ export const messages = pgTable('messages', {
   sessionId: uuid('session_id').references(() => sessions.id).notNull(),
   role: varchar('role', { length: 50 }).notNull(), // 'user' | 'agent'
   content: text('content').notNull(),
+  citationsJson: text('citations_json'),
+  usedDocsJson: text('used_docs_json'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

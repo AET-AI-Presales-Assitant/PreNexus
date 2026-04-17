@@ -36,6 +36,8 @@ class Message(Base):
     session_id = Column("session_id", UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=False)
     role = Column(String(50), nullable=False) # 'user' | 'agent'
     content = Column(Text, nullable=False)
+    citations_json = Column(Text, nullable=True)
+    used_docs_json = Column(Text, nullable=True)
     created_at = Column("created_at", DateTime, default=datetime.utcnow, nullable=False)
 
     session = relationship("Session", back_populates="messages")
@@ -64,6 +66,43 @@ class UserMemory(Base):
 
     user = relationship("User")
     session = relationship("Session")
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column("user_id", UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    session_id = Column("session_id", UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=False)
+    message_id = Column("message_id", UUID(as_uuid=True), ForeignKey("messages.id"), nullable=False)
+    kind = Column(String(64), nullable=False, default="thumbs")
+    value = Column(Integer, nullable=True)
+    note = Column(Text, nullable=True)
+    citations_json = Column("citations_json", Text, nullable=True)
+    metadata_json = Column("metadata_json", Text, nullable=True)
+    created_at = Column("created_at", DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User")
+    session = relationship("Session")
+    message = relationship("Message")
+
+class CachedAnswer(Base):
+    __tablename__ = "cached_answers"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    query_text = Column("query_text", Text, nullable=False, default="")
+    query_norm = Column("query_norm", Text, nullable=False, default="")
+    query_embedding_json = Column("query_embedding_json", Text, nullable=True)
+    answer_text = Column("answer_text", Text, nullable=False, default="")
+    citations_json = Column("citations_json", Text, nullable=True)
+    used_docs_json = Column("used_docs_json", Text, nullable=True)
+    lang = Column(String(8), nullable=False, default="vi")
+    min_role = Column("min_role", String(50), nullable=False, default="Employee")
+    message_id = Column("message_id", UUID(as_uuid=True), ForeignKey("messages.id"), nullable=False, unique=True)
+    created_at = Column("created_at", DateTime, default=datetime.utcnow, nullable=False)
+    last_used_at = Column("last_used_at", DateTime, nullable=True)
+    use_count = Column("use_count", Integer, nullable=False, default=0)
+
+    message = relationship("Message")
 
 class IngestJob(Base):
     __tablename__ = "ingest_jobs"

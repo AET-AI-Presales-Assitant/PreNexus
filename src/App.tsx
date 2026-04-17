@@ -121,12 +121,12 @@ function AppContent() {
       const response = await fetch(apiUrl(`/sessions/${sessionId}`), {
         method: 'DELETE'
       });
-      if (response.ok) {
-        refetchSessions();
-        if (currentSessionId === sessionId) {
-          setMessages([]);
-          setCurrentSessionId(null);
-        }
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) return;
+      refetchSessions();
+      if (currentSessionId === sessionId) {
+        setMessages([]);
+        setCurrentSessionId(null);
       }
     } catch (e) {
       console.error('Failed to delete session', e);
@@ -140,9 +140,9 @@ function AppContent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title })
       });
-      if (response.ok) {
-        refetchSessions();
-      }
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) return;
+      refetchSessions();
     } catch (e) {
       console.error('Failed to update session title', e);
     }
@@ -371,7 +371,7 @@ function AppContent() {
                     ));
                   }
                   setMessages(prev => prev.map(msg => 
-                    msg.id === agentMsgId ? { ...msg, citations: data.citations || [], usedDocs: data.used_docs || [] } : msg
+                    msg.id === agentMsgId ? { ...msg, citations: data.citations || [], usedDocs: data.used_docs || [], persistedId: data.agentMessageId || msg.persistedId, cacheId: data.cacheId || msg.cacheId, cacheHit: Boolean(data.cacheHit) } : msg
                   ));
                 } else if (data.type === 'error') {
                   setMessages(prev => prev.map(msg => 

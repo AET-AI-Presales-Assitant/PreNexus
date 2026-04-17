@@ -11,7 +11,7 @@ def stream_error_sse(step: str, details: str, message: str):
 
         yield _yield_event("trace", {"step": step, "details": details, "status": "error"})
         yield _yield_event("error", {"message": message})
-        yield _yield_event("done", {"citations": [], "used_docs": [], "answer": ""})
+        yield _yield_event("done", {"citations": [], "used_docs": [], "answer": "", "agentMessageId": None})
 
     return _gen()
 

@@ -4,13 +4,13 @@ import threading
 import asyncio
 from typing import List, Optional
 from dotenv import load_dotenv, find_dotenv
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, inspect, text
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import uuid
 import json
@@ -20,6 +20,9 @@ import traceback
 
 from .database import engine, get_db
 from . import models
+from .settings import get_settings
+from .logger import configure_logging, get_logger, new_request_id, set_job_id, set_request_id, set_session_id, set_step
+from .agents.common import detect_language, i18n, normalize_for_match, role_level, tokenize
 
 # Import pipeline
 from .ingestion import KnowledgePipeline
@@ -30,6 +33,9 @@ from .agents.chat_workflow import stream_chat_sse, stream_error_sse
 # models.Base.metadata.create_all(bind=engine)
 
 load_dotenv()
+
+configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+log = get_logger("main")
 
 app = FastAPI()
 
@@ -73,7 +79,7 @@ def _init_pipeline_if_needed(force: bool = False):
         except Exception as e:
             pipeline = None
             pipeline_init_error = f"{type(e).__name__}: {e}"
-            print(f"Warning: Could not initialize KnowledgePipeline. Details: {pipeline_init_error}")
+            log.warning("pipeline_init_failed", extra={"error": pipeline_init_error})
             return None
 
 # Seed Admin User
@@ -88,7 +94,7 @@ def seed_admin(db: Session):
         )
         db.add(new_admin)
         db.commit()
-        print("Admin user seeded")
+        log.info("admin_seeded", extra={"username": "admin"})
         return
     if admin.role != "SuperManager":
         admin.role = "SuperManager"
@@ -99,6 +105,31 @@ def startup_event():
     models.Base.metadata.create_all(bind=engine)
     db = next(get_db())
     seed_admin(db)
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    rid = (request.headers.get("x-request-id") or request.headers.get("x-request_id") or "").strip() or new_request_id()
+    set_request_id(rid)
+    set_session_id(None)
+    set_job_id(None)
+    set_step(None)
+
+    started = time.time()
+    http_log = get_logger("http")
+    http_log.info("request_start", extra={"method": request.method, "path": request.url.path})
+    resp = None
+    try:
+        resp = await call_next(request)
+        resp.headers["X-Request-ID"] = rid
+        return resp
+    except Exception:
+        http_log.exception("request_error", extra={"method": request.method, "path": request.url.path})
+        raise
+    finally:
+        dur_ms = int((time.time() - started) * 1000)
+        status_code = getattr(resp, "status_code", None) if resp is not None else None
+        http_log.info("request_end", extra={"method": request.method, "path": request.url.path, "status_code": status_code, "duration_ms": dur_ms})
 
 # --- Pydantic Schemas ---
 class LoginRequest(BaseModel):
@@ -136,6 +167,16 @@ class ChatRequest(BaseModel):
 
 class AnalyzeGapsRequest(BaseModel):
     queries: List[str]
+
+class FeedbackCreateRequest(BaseModel):
+    userId: str
+    sessionId: str
+    messageId: str
+    kind: str
+    value: Optional[int] = None
+    note: Optional[str] = None
+    citations: Optional[list] = None
+    metadata: Optional[dict] = None
 
 class AdminUserCreateRequest(BaseModel):
     username: str
@@ -200,6 +241,10 @@ def to_dict(obj):
         d['vectorIds'] = d.pop('vector_ids_json')
     if 'chunk_ids_json' in d:
         d['chunkIds'] = d.pop('chunk_ids_json')
+    if 'citations_json' in d:
+        d['citations'] = d.pop('citations_json')
+    if 'used_docs_json' in d:
+        d['usedDocs'] = d.pop('used_docs_json')
     return d
 
 def _safe_json_load(s: str):
@@ -210,17 +255,146 @@ def _safe_json_load(s: str):
 
 def ingest_job_to_dict(job: models.IngestJob):
     d = to_dict(job) or {}
-    if isinstance(d.get("errors"), str):
-        d["errors"] = _safe_json_load(d["errors"]) or []
-    if isinstance(d.get("vectorIds"), str):
-        d["vectorIds"] = _safe_json_load(d["vectorIds"]) or []
-    if isinstance(d.get("chunkIds"), str):
-        d["chunkIds"] = _safe_json_load(d["chunkIds"]) or []
+    d["errors"] = _safe_json_load(d.get("errors")) or []
+    d["vectorIds"] = _safe_json_load(d.get("vectorIds")) or []
+    d["chunkIds"] = _safe_json_load(d.get("chunkIds")) or []
     return d
+
+def message_to_dict(msg: models.Message):
+    d = to_dict(msg) or {}
+    d["citations"] = _safe_json_load(d.get("citations")) or []
+    d["usedDocs"] = _safe_json_load(d.get("usedDocs")) or []
+    return d
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for i in range(n):
+        x = float(a[i])
+        y = float(b[i])
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+def _jaccard_tokens(a: List[str], b: List[str]) -> float:
+    sa = set(a or [])
+    sb = set(b or [])
+    if not sa and not sb:
+        return 0.0
+    inter = len(sa.intersection(sb))
+    uni = len(sa.union(sb))
+    return float(inter) / float(uni) if uni > 0 else 0.0
+
+
+def _find_cached_answer(db: Session, query: str, lang: str, user_role: str, pipeline_obj: Optional[KnowledgePipeline]):
+    enabled = str(os.getenv("ANSWER_CACHE_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return None
+
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    q_norm = normalize_for_match(q)
+    q_tokens = tokenize(q)
+    role_lvl = role_level(user_role)
+    no_data_norm = normalize_for_match((i18n(lang or "vi") or {}).get("no_internal_data") or "")
+
+    allowed_roles = []
+    for r in ["Employee", "Lead", "Manager", "SuperManager"]:
+        if role_lvl >= role_level(r):
+            allowed_roles.append(r)
+
+    max_age_days = int(float(os.getenv("ANSWER_CACHE_MAX_AGE_DAYS", "90") or "90"))
+    cutoff = datetime.min if max_age_days <= 0 else (datetime.utcnow() - timedelta(days=max_age_days))
+
+    best = None
+    best_score = 0.0
+    best_method = ""
+
+    if q_norm:
+        exacts = (
+            db.query(models.CachedAnswer)
+            .filter(models.CachedAnswer.lang == (lang or "vi"))
+            .filter(models.CachedAnswer.query_norm == q_norm)
+            .filter(models.CachedAnswer.min_role.in_(allowed_roles))
+            .filter(models.CachedAnswer.created_at >= cutoff)
+            .order_by(models.CachedAnswer.created_at.desc())
+            .all()
+        )
+        if exacts:
+            best = exacts[0]
+            best_score = 1.0
+            best_method = "exact"
+            ans_text = str(getattr(best, "answer_text", "") or "")
+            if no_data_norm and normalize_for_match(ans_text) == no_data_norm:
+                return None
+            return {"cache": best, "score": best_score, "method": best_method}
+
+    candidate_limit = int(float(os.getenv("ANSWER_CACHE_CANDIDATE_LIMIT", "400") or "400"))
+    candidates = (
+        db.query(models.CachedAnswer)
+        .filter(models.CachedAnswer.lang == (lang or "vi"))
+        .filter(models.CachedAnswer.min_role.in_(allowed_roles))
+        .filter(models.CachedAnswer.created_at >= cutoff)
+        .order_by(models.CachedAnswer.created_at.desc())
+        .limit(max(50, min(candidate_limit, 2000)))
+        .all()
+    )
+
+    emb_query = None
+    if pipeline_obj is not None:
+        try:
+            emb_query = pipeline_obj.embeddings.embed_query(q)
+        except Exception:
+            emb_query = None
+
+    min_cos = float(os.getenv("ANSWER_CACHE_MIN_COS", "0.88") or "0.88")
+    min_jacc = float(os.getenv("ANSWER_CACHE_MIN_JACCARD", "0.78") or "0.78")
+
+    for c in candidates:
+        c_norm = str(getattr(c, "query_norm", "") or "")
+        if emb_query is not None:
+            emb_json = getattr(c, "query_embedding_json", None)
+            if isinstance(emb_json, str) and emb_json.strip():
+                try:
+                    emb_c = json.loads(emb_json)
+                    if isinstance(emb_c, list) and emb_c:
+                        s = _cosine_similarity(emb_query, emb_c)
+                        if s >= min_cos and s > best_score:
+                            best = c
+                            best_score = s
+                            best_method = "cosine"
+                except Exception:
+                    pass
+
+        c_tokens = tokenize(str(getattr(c, "query_text", "") or "")) if getattr(c, "query_text", None) else tokenize(c_norm)
+        s2 = _jaccard_tokens(q_tokens, c_tokens)
+        if s2 >= min_jacc and s2 > best_score:
+            best = c
+            best_score = s2
+            best_method = "jaccard"
+
+    if best is None:
+        return None
+    ans_text = str(getattr(best, "answer_text", "") or "")
+    if no_data_norm and normalize_for_match(ans_text) == no_data_norm:
+        return None
+    return {"cache": best, "score": best_score, "method": best_method}
 
 @app.post("/api/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
     try:
+        set_step("login")
         user = db.query(models.User).filter(
             models.User.username == req.username,
             models.User.password == req.password
@@ -233,12 +407,13 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
             # Instead of throwing HTTPException, return success: False as the frontend expects this JSON structure
             return {"success": False, "message": "Invalid credentials"}
     except Exception as e:
-        print(f"Login error: {e}")
+        get_logger("auth").exception("login_failed", extra={"username": req.username})
         return {"success": False, "message": "Internal Server Error"}
 
 @app.post("/api/register")
 def register(req: RegisterRequest, db: Session = Depends(get_db)):
     try:
+        set_step("register")
         existing = db.query(models.User).filter(models.User.username == req.username).first()
         if existing:
             return {"success": False, "message": "Username already exists"}
@@ -257,20 +432,23 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
         user_dict.pop('password', None)
         return {"success": True, "user": user_dict}
     except Exception as e:
-        print(f"Register error: {e}")
+        get_logger("auth").exception("register_failed", extra={"username": req.username})
         return {"success": False, "message": "Internal Server Error"}
 
 @app.get("/api/sessions")
 def get_sessions(userId: str, db: Session = Depends(get_db)):
     try:
+        set_step("get_sessions")
+        set_session_id(None)
         sessions = db.query(models.Session).filter(models.Session.user_id == userId).order_by(desc(models.Session.created_at)).all()
         return {"success": True, "sessions": [to_dict(s) for s in sessions]}
     except Exception as e:
-        print(f"Error fetching sessions: {e}")
+        get_logger("sessions").exception("get_sessions_failed", extra={"userId": userId})
         return {"success": False, "message": str(e)}
 
 @app.post("/api/sessions")
 def create_session(req: SessionCreateRequest, db: Session = Depends(get_db)):
+    set_step("create_session")
     new_session = models.Session(
         user_id=req.userId,
         title=req.title
@@ -282,11 +460,41 @@ def create_session(req: SessionCreateRequest, db: Session = Depends(get_db)):
 
 @app.get("/api/sessions/{session_id}/messages")
 def get_messages(session_id: str, db: Session = Depends(get_db)):
-    messages = db.query(models.Message).filter(models.Message.session_id == session_id).order_by(models.Message.created_at).all()
-    return {"success": True, "messages": [to_dict(m) for m in messages]}
+    set_step("get_messages")
+    set_session_id(session_id)
+    try:
+        import uuid
+        try:
+            uuid.UUID(session_id)
+        except ValueError:
+            return {"success": False, "error": "Invalid session ID format", "messages": []}
+
+        messages = db.query(models.Message).filter(models.Message.session_id == session_id).order_by(models.Message.created_at).all()
+        
+        msg_ids = [m.id for m in messages]
+        feedbacks = db.query(models.Feedback).filter(
+            models.Feedback.message_id.in_(msg_ids),
+            models.Feedback.kind == "thumbs"
+        ).order_by(models.Feedback.created_at.asc()).all()
+        
+        thumb_map = {str(f.message_id): int(f.value) for f in feedbacks if f.value is not None}
+        
+        res_msgs = []
+        for m in messages:
+            md = message_to_dict(m)
+            if str(m.id) in thumb_map:
+                md["thumb"] = thumb_map[str(m.id)]
+            res_msgs.append(md)
+
+        return {"success": True, "messages": res_msgs}
+    except Exception as e:
+        log.error(f"Error get_messages: {e}")
+        return {"success": False, "messages": []}
 
 @app.post("/api/messages")
 def create_message(req: MessageCreateRequest, db: Session = Depends(get_db)):
+    set_step("create_message")
+    set_session_id(req.sessionId)
     new_msg = models.Message(
         session_id=req.sessionId,
         role=req.role,
@@ -295,7 +503,111 @@ def create_message(req: MessageCreateRequest, db: Session = Depends(get_db)):
     db.add(new_msg)
     db.commit()
     db.refresh(new_msg)
-    return {"success": True, "message": to_dict(new_msg)}
+    return {"success": True, "message": message_to_dict(new_msg)}
+
+@app.post("/api/feedback")
+def create_feedback(req: FeedbackCreateRequest, db: Session = Depends(get_db)):
+    try:
+        set_step("create_feedback")
+        set_session_id(req.sessionId)
+        fb = models.Feedback(
+            user_id=req.userId,
+            session_id=req.sessionId,
+            message_id=req.messageId,
+            kind=(req.kind or "thumbs"),
+            value=req.value,
+            note=req.note,
+            citations_json=json.dumps(req.citations, ensure_ascii=False) if req.citations is not None else None,
+            metadata_json=json.dumps(req.metadata, ensure_ascii=False) if req.metadata is not None else None,
+        )
+        db.add(fb)
+        db.commit()
+        kind = str(req.kind or "thumbs")
+        if kind == "thumbs" and int(req.value or 0) == 1:
+            cached_id = None
+            if isinstance(req.metadata, dict):
+                cached_id = req.metadata.get("cachedAnswerId") or req.metadata.get("cacheId")
+            if cached_id:
+                cid = None
+                try:
+                    cid = uuid.UUID(str(cached_id))
+                except Exception:
+                    cid = str(cached_id)
+                ca = db.query(models.CachedAnswer).filter(models.CachedAnswer.id == cid).first()
+                if ca:
+                    ca.use_count = int(getattr(ca, "use_count", 0) or 0) + 1
+                    ca.last_used_at = datetime.utcnow()
+                    db.commit()
+            else:
+                require_citations = str(os.getenv("ANSWER_CACHE_REQUIRE_CITATIONS", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+                has_citations = False
+                if isinstance(req.metadata, dict) and req.metadata.get("hasCitations") is True:
+                    has_citations = True
+                if isinstance(req.citations, list) and len(req.citations) > 0:
+                    has_citations = True
+                if (not require_citations) or has_citations:
+                    agent_msg = db.query(models.Message).filter(models.Message.id == req.messageId).first()
+                    if agent_msg and agent_msg.session_id:
+                        prev_user = (
+                            db.query(models.Message)
+                            .filter(models.Message.session_id == agent_msg.session_id)
+                            .filter(models.Message.role == "user")
+                            .filter(models.Message.created_at <= agent_msg.created_at)
+                            .order_by(models.Message.created_at.desc())
+                            .first()
+                        )
+                        query_text = (prev_user.content or "").strip() if prev_user else ""
+                        if query_text:
+                            user_role = _get_user_role(db, req.userId, "Employee")
+                            lang = detect_language(query_text)
+                            q_norm = normalize_for_match(query_text)
+                            emb_json = None
+                            p = _init_pipeline_if_needed(force=False)
+                            if p is not None:
+                                try:
+                                    emb = p.embeddings.embed_query(query_text)
+                                    emb_json = json.dumps(emb)
+                                except Exception:
+                                    emb_json = None
+
+                            db.query(models.CachedAnswer).filter(models.CachedAnswer.lang == lang).filter(models.CachedAnswer.query_norm == q_norm).filter(models.CachedAnswer.min_role == user_role).delete(synchronize_session=False)
+                            existing = db.query(models.CachedAnswer).filter(models.CachedAnswer.message_id == req.messageId).first()
+                            if existing is None:
+                                ca = models.CachedAnswer(
+                                    query_text=query_text,
+                                    query_norm=q_norm,
+                                    query_embedding_json=emb_json,
+                                    answer_text=agent_msg.content or "",
+                                    citations_json=getattr(agent_msg, "citations_json", None),
+                                    used_docs_json=getattr(agent_msg, "used_docs_json", None),
+                                    lang=lang,
+                                    min_role=user_role,
+                                    message_id=req.messageId,
+                                    last_used_at=datetime.utcnow(),
+                                    use_count=1,
+                                )
+                                db.add(ca)
+                            db.commit()
+        if kind == "thumbs" and int(req.value or 0) == -1:
+            cached_id = None
+            if isinstance(req.metadata, dict):
+                cached_id = req.metadata.get("cachedAnswerId") or req.metadata.get("cacheId")
+            if cached_id:
+                cid = None
+                try:
+                    cid = uuid.UUID(str(cached_id))
+                except Exception:
+                    cid = str(cached_id)
+                db.query(models.CachedAnswer).filter(models.CachedAnswer.id == cid).delete(synchronize_session=False)
+                db.commit()
+            else:
+                db.query(models.CachedAnswer).filter(models.CachedAnswer.message_id == req.messageId).delete(synchronize_session=False)
+                db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        get_logger("feedback").exception("create_feedback_failed", extra={"userId": req.userId, "sessionId": req.sessionId, "messageId": req.messageId, "kind": req.kind})
+        return {"success": False, "message": str(e)}
 
 def _role_level(role: str) -> int:
     r = (role or "").strip()
@@ -330,6 +642,8 @@ def _get_user_role(db: Session, user_id: Optional[str], fallback_role: str) -> s
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest, db: Session = Depends(get_db)):
+    set_step("chat")
+    set_session_id(str(req.sessionId) if getattr(req, "sessionId", None) else None)
     query = (req.message or "").strip()
     if not query:
         return StreamingResponse(
@@ -338,22 +652,130 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
         )
 
     user_role = _get_user_role(db, req.userId, req.userRole or "Employee")
-    top_k = max(1, min(int(req.topK or 4), 10))
+    lang = detect_language(query)
+    rag_cfg = get_settings().rag
+    top_k = max(1, min(int(req.topK or rag_cfg.default_top_k), rag_cfg.max_top_k))
+    get_logger("chat").info("chat_request", extra={"userId": req.userId, "sessionId": req.sessionId, "userRole": user_role, "topK": top_k})
+
+    def _build_cached_stream(answer_text: str, citations: list, used_docs: list, agent_message_id: Optional[str], cache_id: str):
+        async def _gen_cached():
+            def _yield_event(event_type: str, data: dict):
+                payload = {"type": event_type, **(data or {})}
+                return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            yield _yield_event("trace", {"step": "Decomposition", "details": "QA: cache hit." if lang == "en" else "QA: dùng kết quả từ cache.", "status": "success"})
+            yield _yield_event("trace", {"step": "Delegation", "details": "Skipped retrieval (cache)." if lang == "en" else "Bỏ qua retrieval (cache).", "status": "success"})
+            yield _yield_event("trace", {"step": "Synthesis", "details": "Skipped synthesis (cache)." if lang == "en" else "Bỏ qua synthesis (cache).", "status": "success"})
+            yield _yield_event("answer_start", {})
+            yield _yield_event("chunk", {"content": answer_text or ""})
+            yield _yield_event("done", {"citations": citations or [], "used_docs": used_docs or [], "answer": answer_text or "", "agentMessageId": agent_message_id, "cacheHit": True, "cacheId": cache_id})
+
+        return _gen_cached()
+
+    pre_hit = None
+    try:
+        pre_hit = _find_cached_answer(db, query, lang, user_role, None)
+    except Exception:
+        pre_hit = None
+    if pre_hit and pre_hit.get("cache"):
+        ca = pre_hit["cache"]
+        citations = []
+        used_docs = []
+        try:
+            if isinstance(getattr(ca, "citations_json", None), str) and ca.citations_json:
+                citations = json.loads(ca.citations_json) or []
+            if isinstance(getattr(ca, "used_docs_json", None), str) and ca.used_docs_json:
+                used_docs = json.loads(ca.used_docs_json) or []
+        except Exception:
+            pass
+        agent_message_id = None
+        try:
+            if getattr(req, "sessionId", None):
+                new_msg = models.Message(
+                    session_id=req.sessionId, 
+                    role="agent", 
+                    content=getattr(ca, "answer_text", "") or "",
+                    citations_json=getattr(ca, "citations_json", None),
+                    used_docs_json=getattr(ca, "used_docs_json", None)
+                )
+                db.add(new_msg)
+                db.commit()
+                db.refresh(new_msg)
+                agent_message_id = str(new_msg.id)
+        except Exception:
+            db.rollback()
+        try:
+            ca.use_count = int(getattr(ca, "use_count", 0) or 0) + 1
+            ca.last_used_at = datetime.utcnow()
+            db.commit()
+        except Exception:
+            db.rollback()
+        return StreamingResponse(_build_cached_stream(getattr(ca, "answer_text", "") or "", citations, used_docs, agent_message_id, str(getattr(ca, "id"))), media_type="text/event-stream")
+
     async def _gen():
         def _yield_event(event_type: str, data: dict):
             payload = {"type": event_type, **(data or {})}
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-        yield _yield_event("trace", {"step": "Decomposition", "details": "Initializing pipeline...", "status": "pending"})
+        yield _yield_event("trace", {"step": "Decomposition", "details": "Đang khởi tạo pipeline..." if lang == "vi" else "Initializing pipeline...", "status": "pending"})
         ok = await asyncio.to_thread(_init_pipeline_if_needed, False)
         if not ok:
             err = pipeline_init_error or "Unknown initialization error"
-            yield _yield_event("trace", {"step": "Decomposition", "details": f"Pipeline not initialized: {err}", "status": "error"})
+            yield _yield_event("trace", {"step": "Decomposition", "details": f"Pipeline not initialized: {err}" if lang == "en" else f"Lỗi khởi tạo pipeline: {err}", "status": "error"})
             yield _yield_event("error", {"message": f"Pipeline not initialized: {err}"})
-            yield _yield_event("done", {"citations": [], "used_docs": [], "answer": ""})
+            yield _yield_event("done", {"citations": [], "used_docs": [], "answer": "", "agentMessageId": None})
             return
 
-        yield _yield_event("trace", {"step": "Decomposition", "details": "Pipeline initialized.", "status": "success"})
+        try:
+            db_local = next(get_db())
+            try:
+                hit = _find_cached_answer(db_local, query, lang, user_role, pipeline)
+                if hit and hit.get("cache"):
+                    ca = hit["cache"]
+                    citations = []
+                    used_docs = []
+                    try:
+                        if isinstance(getattr(ca, "citations_json", None), str) and ca.citations_json:
+                            citations = json.loads(ca.citations_json) or []
+                        if isinstance(getattr(ca, "used_docs_json", None), str) and ca.used_docs_json:
+                            used_docs = json.loads(ca.used_docs_json) or []
+                    except Exception:
+                        pass
+                    agent_message_id = None
+                    try:
+                        if getattr(req, "sessionId", None):
+                            new_msg = models.Message(
+                                session_id=req.sessionId, 
+                                role="agent", 
+                                content=getattr(ca, "answer_text", "") or "",
+                                citations_json=getattr(ca, "citations_json", None),
+                                used_docs_json=getattr(ca, "used_docs_json", None)
+                            )
+                            db_local.add(new_msg)
+                            db_local.commit()
+                            db_local.refresh(new_msg)
+                            agent_message_id = str(new_msg.id)
+                    except Exception:
+                        db_local.rollback()
+                    try:
+                        ca.use_count = int(getattr(ca, "use_count", 0) or 0) + 1
+                        ca.last_used_at = datetime.utcnow()
+                        db_local.commit()
+                    except Exception:
+                        db_local.rollback()
+                    yield _yield_event("trace", {"step": "Decomposition", "details": "QA: pipeline ready." if lang == "en" else "QA: pipeline sẵn sàng.", "status": "success"})
+                    yield _yield_event("trace", {"step": "Delegation", "details": "Skipped retrieval (cache)." if lang == "en" else "Bỏ qua retrieval (cache).", "status": "success"})
+                    yield _yield_event("trace", {"step": "Synthesis", "details": "Skipped synthesis (cache)." if lang == "en" else "Bỏ qua synthesis (cache).", "status": "success"})
+                    yield _yield_event("answer_start", {})
+                    yield _yield_event("chunk", {"content": getattr(ca, "answer_text", "") or ""})
+                    yield _yield_event("done", {"citations": citations or [], "used_docs": used_docs or [], "answer": getattr(ca, "answer_text", "") or "", "agentMessageId": agent_message_id, "cacheHit": True, "cacheId": str(getattr(ca, "id"))})
+                    return
+            finally:
+                db_local.close()
+        except Exception:
+            pass
+
+        yield _yield_event("trace", {"step": "Decomposition", "details": "QA: pipeline ready." if lang == "en" else "QA: pipeline sẵn sàng.", "status": "success"})
         async for item in stream_chat_sse(pipeline, req, user_role, top_k):
             yield item
 
@@ -390,10 +812,19 @@ def analyze_gaps(req: AnalyzeGapsRequest):
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, db: Session = Depends(get_db)):
     try:
+        set_step("delete_session")
+        set_session_id(session_id)
         try:
             db.execute(text("DELETE FROM followup_contexts WHERE session_id = :sid"), {"sid": session_id})
         except Exception:
             db.rollback()
+        db.query(models.Feedback).filter(models.Feedback.session_id == session_id).delete(synchronize_session=False)
+        db.query(models.SessionMemory).filter(models.SessionMemory.session_id == session_id).delete(synchronize_session=False)
+        db.query(models.UserMemory).filter(models.UserMemory.session_id == session_id).delete(synchronize_session=False)
+        msg_rows = db.query(models.Message.id).filter(models.Message.session_id == session_id).all()
+        msg_ids = [r[0] for r in msg_rows if r and r[0]]
+        if msg_ids:
+            db.query(models.CachedAnswer).filter(models.CachedAnswer.message_id.in_(msg_ids)).delete(synchronize_session=False)
         db.query(models.Message).filter(models.Message.session_id == session_id).delete()
         db.query(models.Session).filter(models.Session.id == session_id).delete()
         db.commit()
@@ -508,7 +939,12 @@ def get_admin_analytics(db: Session = Depends(get_db)):
     return {"success": True, "queries": queries}
 
 @app.post("/api/admin/import")
-async def import_data(background_tasks: BackgroundTasks, file: UploadFile = File(...), role: str = Form("Employee"), db: Session = Depends(get_db)):
+async def import_data(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    role: str = Form("Employee"),
+    db: Session = Depends(get_db),
+):
     if not file:
         raise HTTPException(status_code=400, detail={"success": False, "message": "No file uploaded"})
 
@@ -516,19 +952,23 @@ async def import_data(background_tasks: BackgroundTasks, file: UploadFile = File
         err = pipeline_init_error or "Unknown initialization error"
         return {"success": False, "message": f"Pipeline not initialized: {err}", "error": err}
     
-    upload_dir = os.path.join(os.getcwd(), "uploads")
+    upload_dir = (os.getenv("UPLOADS_DIR") or "").strip()
+    if not upload_dir:
+        upload_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "uploads"))
     os.makedirs(upload_dir, exist_ok=True)
     
     file_path = os.path.join(upload_dir, file.filename)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
+
     job = models.IngestJob(file_name=file.filename, file_path=file_path, role=role, status="queued")
     db.add(job)
     db.commit()
     db.refresh(job)
 
     def _run_job(job_id: str):
+        set_job_id(job_id)
+        set_step("ingest_job_run")
         db_local = next(get_db())
         try:
             j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
@@ -551,7 +991,8 @@ async def import_data(background_tasks: BackgroundTasks, file: UploadFile = File
             if not _init_pipeline_if_needed(force=False):
                 raise RuntimeError(f"Pipeline not initialized: {pipeline_init_error or 'Unknown initialization error'}")
 
-            result = pipeline.process_and_ingest(j.file_path, j.role)
+            get_logger("ingest").info("ingest_job_start", extra={"job_id": job_id, "file_path": j.file_path, "role": j.role})
+            result = pipeline.process_and_ingest(j.file_path, j.role, job_id=str(job_id))
             vector_ids = result.get("vector_ids") if isinstance(result, dict) else []
             chunk_ids = result.get("chunk_ids") if isinstance(result, dict) else []
             errors = result.get("errors") if isinstance(result, dict) else []
@@ -568,7 +1009,9 @@ async def import_data(background_tasks: BackgroundTasks, file: UploadFile = File
             j.chunk_ids_json = json.dumps(chunk_ids or [])
             j.errors_json = json.dumps(errors or [])
             db_local.commit()
+            get_logger("ingest").info("ingest_job_success", extra={"job_id": job_id, "num_chunks_total": j.num_chunks_total, "num_chunks_success": j.num_chunks_success, "num_embeddings": j.num_embeddings})
         except Exception as e:
+            get_logger("ingest").exception("ingest_job_failed", extra={"job_id": job_id})
             try:
                 j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
                 if j:
@@ -595,7 +1038,9 @@ def get_uploaded_file(file_name: str):
         return {"success": False, "message": "Invalid file name"}
     if not safe_name.lower().endswith(".pdf"):
         return {"success": False, "message": "Only PDF files are supported"}
-    upload_dir = os.path.join(os.getcwd(), "uploads")
+    upload_dir = (os.getenv("UPLOADS_DIR") or "").strip()
+    if not upload_dir:
+        upload_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "uploads"))
     file_path = os.path.join(upload_dir, safe_name)
     if not os.path.exists(file_path):
         return {"success": False, "message": "File not found"}
@@ -631,6 +1076,8 @@ def retry_ingest_job(job_id: str, background_tasks: BackgroundTasks, db: Session
     db.refresh(new_job)
 
     def _run_job(job_id2: str):
+        set_job_id(job_id2)
+        set_step("ingest_job_retry_run")
         db_local = next(get_db())
         try:
             j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id2).first()
@@ -647,7 +1094,8 @@ def retry_ingest_job(job_id: str, background_tasks: BackgroundTasks, db: Session
             if not _init_pipeline_if_needed(force=False):
                 raise RuntimeError(f"Pipeline not initialized: {pipeline_init_error or 'Unknown initialization error'}")
 
-            result = pipeline.process_and_ingest(j.file_path, j.role)
+            get_logger("ingest").info("ingest_job_start", extra={"job_id": job_id2, "file_path": j.file_path, "role": j.role})
+            result = pipeline.process_and_ingest(j.file_path, j.role, job_id=str(job_id2))
             vector_ids = result.get("vector_ids") if isinstance(result, dict) else []
             chunk_ids = result.get("chunk_ids") if isinstance(result, dict) else []
             errors = result.get("errors") if isinstance(result, dict) else []
@@ -664,7 +1112,9 @@ def retry_ingest_job(job_id: str, background_tasks: BackgroundTasks, db: Session
             j.chunk_ids_json = json.dumps(chunk_ids or [])
             j.errors_json = json.dumps(errors or [])
             db_local.commit()
+            get_logger("ingest").info("ingest_job_success", extra={"job_id": job_id2, "num_chunks_total": j.num_chunks_total, "num_chunks_success": j.num_chunks_success, "num_embeddings": j.num_embeddings})
         except Exception as e:
+            get_logger("ingest").exception("ingest_job_failed", extra={"job_id": job_id2})
             try:
                 j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id2).first()
                 if j:
@@ -717,6 +1167,7 @@ def get_documents():
         err = pipeline_init_error or "Unknown initialization error"
         return {"success": False, "message": f"Pipeline not initialized: {err}", "error": err}
     try:
+        set_step("admin_documents_list")
         docs = None
         try:
             docs = pipeline.vectorstore.get(include=["documents", "metadatas", "embeddings"])
@@ -756,11 +1207,11 @@ def get_documents():
                     "createdAt": metadata.get("createdAt"),
                     "source": src_name,
                     "tags": tags,
-                    "embedding": embedding
+                    "embedding": embedding,
                 })
         return {"success": True, "documents": documents}
     except Exception as e:
-        print(f"Error getting documents: {e}")
+        get_logger("admin.documents").exception("documents_list_failed")
         return {"success": False, "message": "Error getting documents", "error": str(e)}
 
 @app.delete("/api/admin/documents/{doc_id}")
@@ -769,6 +1220,7 @@ def delete_document(doc_id: str):
         err = pipeline_init_error or "Unknown initialization error"
         return {"success": False, "message": f"Pipeline not initialized: {err}", "error": err}
     try:
+        set_step("admin_documents_delete")
         pipeline.vectorstore.delete(ids=[doc_id])
         try:
             if hasattr(pipeline, "retriever") and hasattr(pipeline.retriever, "docstore"):
@@ -777,7 +1229,7 @@ def delete_document(doc_id: str):
             pass
         return {"success": True, "message": "Document deleted successfully"}
     except Exception as e:
-        print(f"Error deleting document: {e}")
+        get_logger("admin.documents").exception("documents_delete_failed", extra={"doc_id": doc_id})
         return {"success": False, "message": "Error deleting document", "error": str(e)}
 
 if __name__ == "__main__":

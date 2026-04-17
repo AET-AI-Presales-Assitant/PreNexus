@@ -6,6 +6,7 @@ import { Message } from '../types';
 import { apiUrl } from '../lib/api';
 import { useEffect, useRef, FormEvent, useState } from 'react';
 import { Dialog, DialogContent } from './ui/dialog';
+import { FeedbackBar } from './FeedbackBar';
 
 const STARTER_QUESTIONS_POOL = [
   'Find a case study for financial services',
@@ -90,6 +91,10 @@ function AgentMessageContent({ content }: { content: string }) {
 function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any[] }) {
   const [open, setOpen] = useState(false);
   const [selectedFile, setSelectedFile] = useState<string>('');
+  const [activePage, setActivePage] = useState<number | null>(null);
+  
+  const [filterCategory, setFilterCategory] = useState<string>('All');
+  const [filterRole, setFilterRole] = useState<string>('All');
 
   if (!Array.isArray(citations) || citations.length === 0) return null;
 
@@ -107,8 +112,15 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
     if (id && src) sourceById.set(id, src);
   }
 
+  // Filter citations based on user selection
+  const filteredCitations = citations.filter(c => {
+    if (filterCategory !== 'All' && c.category !== filterCategory) return false;
+    if (filterRole !== 'All' && c.role !== filterRole) return false;
+    return true;
+  });
+
   const grouped = new Map<string, any[]>();
-  for (const c of citations) {
+  for (const c of filteredCitations) {
     const fid = String(c?.id || '');
     const src = fileNameFrom(c?.source) || (fid ? (sourceById.get(fid) || '') : '');
     if (!src) continue;
@@ -121,16 +133,54 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
   const pdfFiles = allFiles.filter(f => f.toLowerCase().endsWith('.pdf'));
   const filesToShow = pdfFiles.length > 0 ? pdfFiles : allFiles;
 
-  const openPdf = (fileName: string) => {
-    const url = apiUrl(`/files/${encodeURIComponent(fileName)}`);
+  // Extract unique categories and roles for filters
+  const categories = Array.from(new Set(citations.map(c => c.category).filter(Boolean)));
+  const roles = Array.from(new Set(citations.map(c => c.role).filter(Boolean)));
+
+  const openPdf = (fileName: string, page?: number | null, snippet?: string) => {
+    let url = apiUrl(`/files/${encodeURIComponent(fileName)}`);
+    const hashParams = [];
+    if (page) hashParams.push(`page=${page}`);
+    if (snippet) hashParams.push(`:~:text=${encodeURIComponent(snippet.slice(0, 50))}`);
+    if (hashParams.length > 0) {
+      url += `#${hashParams.join('&')}`;
+    }
     window.open(url, '_blank', 'noopener,noreferrer');
   };
 
   const selectedCitations = selectedFile ? (grouped.get(selectedFile) || []) : [];
+  const isSelectedPdf = selectedFile.toLowerCase().endsWith('.pdf');
 
   return (
     <div className="mt-4">
       <div className="text-[11px] font-bold text-neutral-500 tracking-wider uppercase mb-2">Knowledge sources used</div>
+      
+      {/* Filters */}
+      {(categories.length > 1 || roles.length > 1) && (
+        <div className="flex gap-2 mb-3">
+          {categories.length > 1 && (
+            <select 
+              className="text-xs border-neutral-200 rounded-md bg-white/60 px-2 py-1"
+              value={filterCategory}
+              onChange={(e) => setFilterCategory(e.target.value)}
+            >
+              <option value="All">All Categories</option>
+              {categories.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          )}
+          {roles.length > 1 && (
+            <select 
+              className="text-xs border-neutral-200 rounded-md bg-white/60 px-2 py-1"
+              value={filterRole}
+              onChange={(e) => setFilterRole(e.target.value)}
+            >
+              <option value="All">All Roles</option>
+              {roles.map(r => <option key={r} value={r}>{r}</option>)}
+            </select>
+          )}
+        </div>
+      )}
+
       <div className="space-y-2">
         {filesToShow.map((f) => (
           <div key={f} className="flex items-center gap-3 bg-white/60 border border-neutral-200 rounded-xl px-3 py-2">
@@ -146,41 +196,73 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
                 Open
               </Button>
             ) : null}
-            <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => { setSelectedFile(f); setOpen(true); }}>
+            <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => { setSelectedFile(f); setActivePage(null); setOpen(true); }}>
               View
             </Button>
           </div>
         ))}
+        {filesToShow.length === 0 && (
+          <div className="text-xs text-neutral-500 italic">No sources match the selected filters.</div>
+        )}
       </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="bg-white rounded-2xl w-full max-w-3xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden p-0">
-          <div className="flex items-center justify-between p-6 border-b border-neutral-100">
+        <DialogContent className={`bg-white rounded-2xl w-full ${isSelectedPdf ? 'max-w-6xl' : 'max-w-3xl'} h-[85vh] flex flex-col shadow-2xl overflow-hidden p-0`}>
+          <div className="flex items-center justify-between p-4 border-b border-neutral-100 bg-neutral-50 shrink-0">
             <div className="text-lg font-semibold text-neutral-900 truncate">{selectedFile || 'Source'}</div>
-            {selectedFile && selectedFile.toLowerCase().endsWith('.pdf') ? (
-              <Button variant="outline" size="sm" className="h-9" onClick={() => openPdf(selectedFile)}>
+            {isSelectedPdf ? (
+              <Button variant="outline" size="sm" className="h-9" onClick={() => openPdf(selectedFile, activePage)}>
                 <ExternalLink className="w-4 h-4 mr-2" />
                 Open PDF
               </Button>
             ) : null}
           </div>
 
-          <div className="p-8 overflow-y-auto flex-1 space-y-3">
-            {selectedCitations.length === 0 ? (
-              <div className="text-sm text-neutral-500">No details.</div>
-            ) : (
-              selectedCitations.slice(0, 8).map((c, idx) => (
-                <div key={`${c.id}-${idx}`} className="rounded-lg border border-neutral-200 p-3">
-                  <div className="text-sm font-semibold text-neutral-900">
-                    {c.title || 'Snippet'}
-                  </div>
-                  {c.snippet ? (
-                    <div className="text-xs text-neutral-700 mt-2 whitespace-pre-wrap leading-relaxed">
-                      {c.snippet}
+          <div className="flex-1 flex overflow-hidden">
+            {/* Snippets List */}
+            <div className={`${isSelectedPdf ? 'w-1/3 border-r' : 'w-full'} p-4 overflow-y-auto space-y-3 bg-white`}>
+              {selectedCitations.length === 0 ? (
+                <div className="text-sm text-neutral-500">No details.</div>
+              ) : (
+                selectedCitations.slice(0, 15).map((c, idx) => (
+                  <div 
+                    key={`${c.id}-${idx}`} 
+                    className={`rounded-lg border p-3 cursor-pointer transition-colors ${activePage === c.page && isSelectedPdf ? 'border-indigo-400 bg-indigo-50/50' : 'border-neutral-200 hover:border-indigo-200 hover:bg-neutral-50'}`}
+                    onClick={() => {
+                      if (c.page) setActivePage(c.page);
+                    }}
+                  >
+                    <div className="flex justify-between items-start mb-2">
+                      <div className="text-sm font-semibold text-neutral-900 line-clamp-2">
+                        {c.title || 'Snippet'}
+                      </div>
+                      {c.page && (
+                        <span className="ml-2 shrink-0 px-2 py-0.5 bg-neutral-100 text-neutral-600 text-[10px] font-bold rounded-md">
+                          Pg {c.page}
+                        </span>
+                      )}
                     </div>
-                  ) : null}
-                </div>
-              ))
+                    {c.snippet ? (
+                      <div className="text-xs text-neutral-700 whitespace-pre-wrap leading-relaxed line-clamp-5">
+                        {/* Highlight snippet roughly */}
+                        {c.snippet}
+                      </div>
+                    ) : null}
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* PDF Preview Iframe */}
+            {isSelectedPdf && (
+              <div className="w-2/3 bg-neutral-100 flex-1 relative">
+                <iframe 
+                  key={`${selectedFile}-${activePage}`}
+                  src={`${apiUrl(`/files/${encodeURIComponent(selectedFile)}`)}#page=${activePage || 1}${activePage ? `&search=${encodeURIComponent(selectedCitations.find(c => c.page === activePage)?.snippet?.slice(0, 30) || '')}` : ''}`} 
+                  className="absolute inset-0 w-full h-full border-0"
+                  title="PDF Preview"
+                />
+              </div>
             )}
           </div>
         </DialogContent>
@@ -363,6 +445,9 @@ export function ChatArea({
                     )}
                     {msg.role === 'agent' && !shouldHideSourcesForMessage(msg.content || '') && Array.isArray(msg.citations) && msg.citations.length > 0 && (
                       <SourcesUsed citations={msg.citations} usedDocs={msg.usedDocs} />
+                    )}
+                    {msg.role === 'agent' && !(isProcessing && i === lastAgentIndex) && (
+                      <FeedbackBar message={msg} />
                     )}
                   </div>
                 </div>

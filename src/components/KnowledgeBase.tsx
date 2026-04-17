@@ -44,7 +44,12 @@ const KNOWLEDGE_TYPES = [
   }
 ];
 
-export function KnowledgeBase({ documents, userRole, onDeleteDocument, onEditDocument }: KnowledgeBaseProps) {
+export function KnowledgeBase({
+  documents,
+  userRole,
+  onDeleteDocument,
+  onEditDocument,
+}: KnowledgeBaseProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedType, setSelectedType] = useState<string | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(false);

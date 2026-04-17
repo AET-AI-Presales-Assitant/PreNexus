@@ -6,7 +6,7 @@ from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel, Field
 
 # LangChain Imports
-from langchain_community.document_loaders import Docx2txtLoader, UnstructuredExcelLoader, TextLoader
+from langchain_community.document_loaders import Docx2txtLoader, UnstructuredExcelLoader, TextLoader, UnstructuredPowerPointLoader
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_chroma import Chroma
@@ -22,6 +22,11 @@ import unicodedata
 import time
 import random
 from typing import Iterator, Sequence, Tuple
+
+from .settings import get_settings
+from .logger import get_logger, set_job_id, set_step
+
+log = get_logger("ingestion")
 
 class LocalFileStore(ByteStore):
     def __init__(self, root_path: str):
@@ -231,50 +236,28 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
     page_count = doc_fitz.page_count
     if max_pages is not None:
         page_count = min(page_count, max_pages)
+    pdf_cfg = get_settings().pdf_hybrid
 
-    def _env_int(name: str, default: int) -> int:
-        try:
-            return int(os.getenv(name, str(default)) or str(default))
-        except Exception:
-            return default
-
-    def _env_bool(name: str, default: bool) -> bool:
-        v = os.getenv(name)
-        if v is None:
-            return default
-        s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
-            return True
-        if s in {"0", "false", "no", "n", "off"}:
-            return False
-        return default
-
-    def _env_float(name: str, default: float) -> float:
-        try:
-            return float(os.getenv(name, str(default)) or str(default))
-        except Exception:
-            return default
-
-    text_min_chars = max(0, _env_int("PDF_HYBRID_TEXT_MIN_CHARS", 450))
-    image_min_count = max(0, _env_int("PDF_HYBRID_IMAGE_MIN_COUNT", 1))
-    max_vision_pages = max(0, _env_int("PDF_HYBRID_MAX_VISION_PAGES", 10))
-    force_vision = _env_bool("PDF_HYBRID_FORCE_VISION", False)
+    text_min_chars = pdf_cfg.text_min_chars
+    image_min_count = pdf_cfg.image_min_count
+    max_vision_pages = pdf_cfg.max_vision_pages
+    force_vision = pdf_cfg.force_vision
     text_min_chars_text_dense = int(text_min_chars)
     text_min_chars_image_dense = int(text_min_chars)
     text_min_chars_mixed_image_text = int(text_min_chars)
 
-    sample_first_pages = max(0, min(_env_int("PDF_HYBRID_SAMPLE_FIRST_PAGES", 2), page_count))
-    sample_force_vision = _env_bool("PDF_HYBRID_SAMPLE_FORCE_VISION", True)
-    sample_disable_gain = _env_float("PDF_HYBRID_SAMPLE_DISABLE_GAIN_RATIO", 1.08)
-    sample_enable_gain = _env_float("PDF_HYBRID_SAMPLE_ENABLE_GAIN_RATIO", 1.25)
-    sample_text_multiplier = _env_float("PDF_HYBRID_SAMPLE_TEXT_MIN_CHARS_MULTIPLIER", 1.5)
-    sample_struct_desc_min = max(0, _env_int("PDF_HYBRID_SAMPLE_STRUCT_DESC_MIN_CHARS", 120))
-    mixed_image_text_compact_min = max(0, _env_int("PDF_HYBRID_MIXED_IMAGE_TEXT_MIN_CHARS", 1200))
-    mixed_image_text_multiplier = max(1.0, _env_float("PDF_HYBRID_MIXED_IMAGE_TEXT_MULTIPLIER", 3.0))
-    img_area_ratio_icon_max = max(0.0, min(_env_float("PDF_HYBRID_IMG_AREA_RATIO_ICON_MAX", 0.03), 1.0))
-    img_area_ratio_large_min = max(0.0, min(_env_float("PDF_HYBRID_IMG_AREA_RATIO_LARGE_MIN", 0.18), 1.0))
-    mixed_image_text_large_img_area_min = max(0.0, min(_env_float("PDF_HYBRID_MIXED_IMAGE_TEXT_LARGE_IMG_AREA_MIN", img_area_ratio_large_min), 1.0))
-    drawings_min_count = max(0, _env_int("PDF_HYBRID_DRAWINGS_MIN_COUNT", 15))
+    sample_first_pages = max(0, min(pdf_cfg.sample_first_pages, page_count))
+    sample_force_vision = pdf_cfg.sample_force_vision
+    sample_disable_gain = pdf_cfg.sample_disable_gain_ratio
+    sample_enable_gain = pdf_cfg.sample_enable_gain_ratio
+    sample_text_multiplier = pdf_cfg.sample_text_min_chars_multiplier
+    sample_struct_desc_min = pdf_cfg.sample_struct_desc_min_chars
+    mixed_image_text_compact_min = pdf_cfg.mixed_image_text_min_chars
+    mixed_image_text_multiplier = pdf_cfg.mixed_image_text_multiplier
+    img_area_ratio_icon_max = pdf_cfg.img_area_ratio_icon_max
+    img_area_ratio_large_min = pdf_cfg.img_area_ratio_large_min
+    mixed_image_text_large_img_area_min = pdf_cfg.mixed_image_text_large_img_area_min
+    drawings_min_count = pdf_cfg.drawings_min_count
 
     vision_llm = None
     vision_pages_used = 0
@@ -407,6 +390,7 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
                 pix = fitz_page.get_pixmap(matrix=fitz.Matrix(2, 2))
                 img_bytes = pix.tobytes("png")
                 img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                time.sleep(4) # Rate limit protection for Gemini free tier
                 vision_msg = vision_llm.invoke(
                     [
                         {"role": "user", "content": [
@@ -420,7 +404,8 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
                 vision_text_clean = _strip_code_fences(vision_text_raw)
                 vision_obj = _try_parse_json(vision_text_clean)
             except Exception as e:
-                print(f"Error occurred while calling Vision API on page {page_num + 1}: {e}")
+                set_step("vision")
+                log.exception("vision_api_failed", extra={"page": page_num + 1})
                 vision_text_raw = ""
                 vision_text_clean = ""
                 vision_obj = None
@@ -509,6 +494,8 @@ def load_file(file_path: str, llm=None) -> List[Document]:
         loader = UnstructuredExcelLoader(file_path)
     elif ext == '.txt':
         loader = TextLoader(file_path, encoding='utf-8')
+    elif ext == '.pptx':
+        loader = UnstructuredPowerPointLoader(file_path)
     else:
         raise ValueError(f"File format not supported: {ext}")
     return loader.load()
@@ -538,23 +525,29 @@ class ChunkClassification(BaseModel):
 
 class KnowledgePipeline:
     def __init__(self, api_key: str):
+        settings = get_settings()
         os.environ["GEMINI_API_KEY"] = api_key
         self.llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0)
         self.embeddings = _ThrottledEmbeddings(GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001"))
-        
+
+        persist_dir = (os.getenv("CHROMA_PERSIST_DIR") or "").strip()
+        if not persist_dir:
+            persist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "chroma_data"))
+        os.makedirs(persist_dir, exist_ok=True)
+
         self.vectorstore = Chroma(
             collection_name="presales_summaries",
             embedding_function=self.embeddings,
-            persist_directory="./chroma_data"
+            persist_directory=persist_dir,
         )
 
         self.memory_store = Chroma(
             collection_name="conversation_memories",
             embedding_function=self.embeddings,
-            persist_directory="./chroma_data"
+            persist_directory=persist_dir,
         )
-        
-        self.store = LocalFileStore("./chroma_data/bytestore")
+
+        self.store = LocalFileStore(os.path.join(persist_dir, "bytestore"))
         self.id_key = "doc_id"
         
         self.retriever = MultiVectorRetriever(
@@ -564,22 +557,30 @@ class KnowledgePipeline:
         )
         
         if RecursiveCharacterTextSplitter is not None:
-            self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=2400, chunk_overlap=250)
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=settings.chunking.chunk_size,
+                chunk_overlap=settings.chunking.chunk_overlap,
+            )
         else:
             self.text_splitter = SemanticChunker(self.embeddings, breakpoint_threshold_type="percentile")
 
-    def process_and_ingest(self, file_path: str, role: str = "Employee") -> dict:
-        print(f"1. Reading file: {file_path}...")
+    def process_and_ingest(self, file_path: str, role: str = "Employee", job_id: Optional[str] = None) -> dict:
+        if job_id:
+            set_job_id(str(job_id))
+        set_step("read_file")
+        log.info("ingest_read_file", extra={"file_path": file_path, "role": role})
         docs = load_file(file_path, self.llm)
         
         # Combine all page contents into one full text for better semantic chunking.
         full_text = "\n\n".join([d.page_content for d in docs])
         
-        print("2. Performing Chunking...")
+        set_step("chunking")
+        log.info("ingest_chunking_start")
         chunks = self.text_splitter.create_documents([full_text])
-        print(f"   -> Successfully split into {len(chunks)} chunks.")
+        log.info("ingest_chunking_done", extra={"num_chunks_total": len(chunks)})
         
-        print("3. Extracting Metadata & Generating Summary with LLM...")
+        set_step("metadata_llm")
+        log.info("ingest_metadata_llm_start")
         structured_llm = self.llm.with_structured_output(ChunkClassification)
         
         doc_ids = [str(uuid.uuid4()) for _ in chunks]
@@ -590,6 +591,8 @@ class KnowledgePipeline:
         
         for i, chunk in enumerate(chunks):
             try:
+                set_step("metadata_llm_chunk")
+                time.sleep(4) # Rate limit protection for Gemini free tier (15 RPM)
                 analysis: ChunkClassification = structured_llm.invoke(
                     f"""Analyze the following text for internal knowledge base ingestion.
                     Rules:
@@ -602,7 +605,7 @@ class KnowledgePipeline:
                 
                 # Check if analysis is None or missing attributes
                 if not analysis:
-                    print(f"   ! LLM returned empty analysis for chunk {i+1}")
+                    log.warning("ingest_llm_empty_analysis", extra={"chunk_index": i + 1})
                     continue
 
                 chunk.metadata = {
@@ -656,10 +659,11 @@ class KnowledgePipeline:
                 summary_ids.append(doc_ids[i])
 
             except Exception as e:
-                print(f"   ! Error occurred while processing chunk {i+1}: {e}")
+                log.exception("ingest_chunk_failed", extra={"chunk_index": i + 1})
                 errors.append(str(e))
                 
-        print("4. Saving to Multi-Vector Store (Chroma)...")
+        set_step("save_chroma")
+        log.info("ingest_save_chroma_start")
         # Lưu Full Text vào ByteStore
         self.retriever.docstore.mset(list(zip(doc_ids, chunks)))
         
@@ -667,7 +671,8 @@ class KnowledgePipeline:
         if summary_docs:
             self.vectorstore.add_documents(summary_docs, ids=summary_ids)
             
-        print("Complete Ingestion!\n")
+        set_step("done")
+        log.info("ingest_done", extra={"num_chunks_total": len(chunks), "num_chunks_success": len(summary_ids)})
         return {
             "file_path": file_path,
             "createdAt": created_at_ms,
@@ -683,7 +688,8 @@ class KnowledgePipeline:
         
     def query(self, question: str) -> List[Document]:
         """Search for relevant documents based on the question."""
-        print(f"Searching for: '{question}'...")
+        set_step("query")
+        log.info("retriever_query", extra={"question": question})
         results = self.retriever.invoke(question)
         return results
 

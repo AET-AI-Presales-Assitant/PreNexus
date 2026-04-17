@@ -23,6 +23,10 @@ export interface Message {
   citations?: Citation[];
   usedDocs?: UsedDoc[];
   thoughts?: { step: string; details: string; status: string }[];
+  persistedId?: string;
+  cacheId?: string;
+  cacheHit?: boolean;
+  thumb?: 1 | -1 | 0;
   createdAt: number;
 }
 
