@@ -6,6 +6,7 @@ from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
+
 class User(Base):
     __tablename__ = "users"
 
@@ -18,6 +19,7 @@ class User(Base):
 
     sessions = relationship("Session", back_populates="user")
 
+
 class Session(Base):
     __tablename__ = "sessions"
 
@@ -28,6 +30,7 @@ class Session(Base):
 
     user = relationship("User", back_populates="sessions")
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
+
 
 class Message(Base):
     __tablename__ = "messages"
@@ -42,6 +45,7 @@ class Message(Base):
 
     session = relationship("Session", back_populates="messages")
 
+
 class SessionMemory(Base):
     __tablename__ = "session_memories"
 
@@ -52,6 +56,7 @@ class SessionMemory(Base):
     updated_at = Column("updated_at", DateTime, default=datetime.utcnow, nullable=False)
 
     session = relationship("Session")
+
 
 class UserMemory(Base):
     __tablename__ = "user_memories"
@@ -66,6 +71,7 @@ class UserMemory(Base):
 
     user = relationship("User")
     session = relationship("Session")
+
 
 class Feedback(Base):
     __tablename__ = "feedback"
@@ -85,6 +91,7 @@ class Feedback(Base):
     session = relationship("Session")
     message = relationship("Message")
 
+
 class CachedAnswer(Base):
     __tablename__ = "cached_answers"
 
@@ -103,6 +110,7 @@ class CachedAnswer(Base):
     use_count = Column("use_count", Integer, nullable=False, default=0)
 
     message = relationship("Message")
+
 
 class IngestJob(Base):
     __tablename__ = "ingest_jobs"

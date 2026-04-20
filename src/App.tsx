@@ -69,11 +69,6 @@ function AppContent() {
     }
   }, [isLoggedIn]);
 
-  // We no longer need to initialize local embeddings since it's handled by ChromaDB on backend
-  // useEffect(() => {
-  //   const initEmbeddings = async () => { ...
-  // }, []);
-
   useEffect(() => {
     const handleResize = () => {
       if (window.innerWidth <= 1024) {
@@ -167,14 +162,20 @@ function AppContent() {
   };
 
   const handleAnalyzeGaps = async (queries: string[]) => {
-    const response = await fetch(apiUrl('/admin/analyze_gaps'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ queries })
-    });
-    const data = await response.json();
-    if (data.success) return data.result;
-    return null;
+    try {
+      const response = await fetch(apiUrl('/admin/analyze_gaps'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ queries })
+      });
+      const data = await response.json();
+      if (data.success) return data.result;
+      console.error("Analyze gaps failed on server:", data.message || data.error);
+      return null;
+    } catch (e) {
+      console.error("Error calling analyze_gaps:", e);
+      return null;
+    }
   };
 
   const handleAuth = async (e: React.FormEvent) => {

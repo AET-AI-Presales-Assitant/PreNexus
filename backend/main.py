@@ -14,9 +14,8 @@ from datetime import datetime, timedelta
 import time
 import uuid
 import json
-import re
-import unicodedata
 import traceback
+import queue
 
 from .database import engine, get_db
 from . import models
@@ -26,11 +25,7 @@ from .agents.common import detect_language, i18n, normalize_for_match, role_leve
 
 # Import pipeline
 from .ingestion import KnowledgePipeline
-from langchain_core.documents import Document
 from .agents.chat_workflow import stream_chat_sse, stream_error_sse
-
-# Create tables if they don't exist (Drizzle handles this, but we can do it here too just in case)
-# models.Base.metadata.create_all(bind=engine)
 
 load_dotenv()
 
@@ -50,6 +45,96 @@ app.add_middleware(
 pipeline_lock = threading.Lock()
 pipeline_init_error = None
 pipeline = None
+
+ingest_queue = queue.Queue()
+
+def _ingest_worker():
+    while True:
+        job_id = ingest_queue.get()
+        if job_id is None:
+            break
+        try:
+            _run_ingest_job(job_id)
+        except Exception as e:
+            log.exception("ingest_worker_error", extra={"error": str(e)})
+        finally:
+            ingest_queue.task_done()
+
+# Khởi tạo 4 workers xử lý song song
+NUM_WORKERS = int(os.getenv("INGEST_NUM_WORKERS", "4"))
+for _ in range(NUM_WORKERS):
+    threading.Thread(target=_ingest_worker, daemon=True).start()
+
+def _run_ingest_job(job_id: str):
+    set_job_id(job_id)
+    set_step("ingest_job_run")
+    db_local = next(get_db())
+    try:
+        j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
+        if not j:
+            return
+        j.status = "processing"
+        j.started_at = datetime.utcnow()
+        j.error = None
+        j.errors_json = None
+        j.vector_ids_json = None
+        j.chunk_ids_json = None
+        j.num_chunks_total = None
+        j.num_chunks_success = None
+        j.num_summary_docs = None
+        j.num_chunk_docs = None
+        j.num_embeddings = None
+        j.embedding_model = None
+        db_local.commit()
+
+        if not _init_pipeline_if_needed(force=False):
+            raise RuntimeError(f"Pipeline not initialized: {pipeline_init_error or 'Unknown initialization error'}")
+
+        get_logger("ingest").info("ingest_job_start", extra={"job_id": job_id, "file_path": j.file_path, "role": j.role})
+        result = pipeline.process_and_ingest(j.file_path, j.role, job_id=str(job_id))
+        vector_ids = result.get("vector_ids") if isinstance(result, dict) else []
+        chunk_ids = result.get("chunk_ids") if isinstance(result, dict) else []
+        errors = result.get("errors") if isinstance(result, dict) else []
+
+        j.status = "success"
+        j.finished_at = datetime.utcnow()
+        j.num_chunks_total = int(result.get("num_chunks_total") or 0) if isinstance(result, dict) else None
+        j.num_chunks_success = int(result.get("num_chunks_success") or 0) if isinstance(result, dict) else None
+        j.num_summary_docs = int(result.get("num_summary_docs") or 0) if isinstance(result, dict) else None
+        j.num_chunk_docs = int(result.get("num_chunk_docs") or 0) if isinstance(result, dict) else None
+        j.num_embeddings = (j.num_summary_docs or 0) + (j.num_chunk_docs or 0)
+        j.embedding_model = str(result.get("embedding_model") or "") if isinstance(result, dict) else None
+        j.vector_ids_json = json.dumps(vector_ids or [])
+        j.chunk_ids_json = json.dumps(chunk_ids or [])
+        j.errors_json = json.dumps(errors or [])
+        db_local.commit()
+        get_logger("ingest").info("ingest_job_success", extra={"job_id": job_id, "num_chunks_total": j.num_chunks_total, "num_chunks_success": j.num_chunks_success, "num_embeddings": j.num_embeddings})
+        
+        # Dọn dẹp file vật lý sau khi xử lý thành công
+        try:
+            if os.path.exists(j.file_path):
+                os.remove(j.file_path)
+                get_logger("ingest").info("ingest_job_cleanup_success", extra={"job_id": job_id, "file_path": j.file_path})
+        except Exception as cleanup_err:
+            get_logger("ingest").warning("ingest_job_cleanup_failed", extra={"job_id": job_id, "file_path": j.file_path, "error": str(cleanup_err)})
+
+    except Exception as e:
+        get_logger("ingest").exception("ingest_job_failed", extra={"job_id": job_id})
+        try:
+            j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
+            if j:
+                j.status = "error"
+                j.finished_at = datetime.utcnow()
+                j.error = f"{type(e).__name__}: {e}"
+                j.errors_json = json.dumps([
+                    {"pipeline_none": pipeline is None, "pipeline_init_error": pipeline_init_error},
+                    traceback.format_exc(limit=12),
+                ], ensure_ascii=False)
+                db_local.commit()
+        except Exception:
+            pass
+    finally:
+        db_local.close()
 
 def _get_api_key() -> str:
     return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
@@ -167,6 +252,18 @@ class ChatRequest(BaseModel):
 
 class AnalyzeGapsRequest(BaseModel):
     queries: List[str]
+
+class GapAnalysisInterest(BaseModel):
+    topic: str
+    reason: str
+
+class GapAnalysisGap(BaseModel):
+    question: str
+    suggestion: str
+
+class GapAnalysisResponse(BaseModel):
+    topInterests: List[GapAnalysisInterest]
+    knowledgeGaps: List[GapAnalysisGap]
 
 class FeedbackCreateRequest(BaseModel):
     userId: str
@@ -463,7 +560,6 @@ def get_messages(session_id: str, db: Session = Depends(get_db)):
     set_step("get_messages")
     set_session_id(session_id)
     try:
-        import uuid
         try:
             uuid.UUID(session_id)
         except ValueError:
@@ -789,23 +885,24 @@ def analyze_gaps(req: AnalyzeGapsRequest):
     queries = req.queries[:100]
     prompt = f"""
         You are an AI analyst for a Presales Knowledge Base. Analyze the following user queries to provide insights for the admin.
-        Return ONLY JSON (no Markdown, no extra text) matching:
-        {{
-          "topInterests": [{{"topic": "string", "reason": "string"}}],
-          "knowledgeGaps": [{{"question": "string", "suggestion": "string"}}]
-        }}
+        
+        USER QUERIES:
+        {chr(10).join(queries)}
+
         Rules:
         - topInterests: max 3 items.
         - knowledgeGaps: 2-3 items.
         - reason/suggestion must be short and actionable.
         - Do not include secrets/PII if the queries contain sensitive info.
-        USER QUERIES:
-        {chr(10).join(queries)}
     """
     try:
-        msg = pipeline.llm.invoke(prompt)
-        text = msg.content if hasattr(msg, "content") else str(msg)
-        return {"success": True, "result": text}
+        structured_llm = pipeline.llm.with_structured_output(GapAnalysisResponse)
+        analysis: GapAnalysisResponse = structured_llm.invoke(prompt)
+        
+        # Chuyển đổi về JSON string để Frontend có thể parse như trước
+        result_json = analysis.model_dump_json()
+        
+        return {"success": True, "result": result_json}
     except Exception as e:
         return {"success": False, "message": "Error analyzing gaps", "error": str(e)}
 
@@ -893,13 +990,14 @@ def admin_update_user(user_id: str, req: AdminUserUpdateRequest, db: Session = D
 
 @app.get("/api/admin/analytics")
 def get_admin_analytics(db: Session = Depends(get_db)):
-    # Fetch all messages joined with session and user
-    # To keep it simple, we can fetch messages and join manually or use SQLAlchemy joins
     results = db.query(models.Message, models.Session, models.User).join(
         models.Session, models.Message.session_id == models.Session.id
     ).join(
         models.User, models.Session.user_id == models.User.id
     ).order_by(models.Message.created_at).all()
+
+    feedbacks = db.query(models.Feedback).all()
+    feedback_map = {str(f.message_id): f for f in feedbacks}
 
     message_map = {}
     for msg, sess, usr in results:
@@ -922,8 +1020,16 @@ def get_admin_analytics(db: Session = Depends(get_db)):
             msg = msgs[i]
             if msg["role"] == "user":
                 answer_content = None
+                feedback_value = None
+                feedback_note = None
                 if i + 1 < len(msgs) and msgs[i+1]["role"] == "agent":
-                    answer_content = msgs[i+1]["content"]
+                    ans_msg = msgs[i+1]
+                    answer_content = ans_msg["content"]
+                    ans_id = ans_msg["id"]
+                    if ans_id in feedback_map:
+                        fb = feedback_map[ans_id]
+                        feedback_value = fb.value
+                        feedback_note = fb.note
                 
                 queries.append({
                     "id": msg["id"],
@@ -932,11 +1038,16 @@ def get_admin_analytics(db: Session = Depends(get_db)):
                     "userName": msg["userName"],
                     "userRole": msg["userRole"],
                     "sessionTitle": msg["sessionTitle"],
-                    "answerContent": answer_content
+                    "answerContent": answer_content,
+                    "feedbackValue": feedback_value,
+                    "feedbackNote": feedback_note
                 })
 
     queries.sort(key=lambda x: x["createdAt"], reverse=True)
     return {"success": True, "queries": queries}
+
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 @app.post("/api/admin/import")
 async def import_data(
@@ -947,6 +1058,17 @@ async def import_data(
 ):
     if not file:
         raise HTTPException(status_code=400, detail={"success": False, "message": "No file uploaded"})
+
+    # Kiểm tra kích thước file
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+    
+    if file_size > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413, 
+            detail={"success": False, "message": f"File size exceeds the limit of {MAX_FILE_SIZE_MB}MB"}
+        )
 
     if not _init_pipeline_if_needed(force=False):
         err = pipeline_init_error or "Unknown initialization error"
@@ -966,69 +1088,7 @@ async def import_data(
     db.commit()
     db.refresh(job)
 
-    def _run_job(job_id: str):
-        set_job_id(job_id)
-        set_step("ingest_job_run")
-        db_local = next(get_db())
-        try:
-            j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
-            if not j:
-                return
-            j.status = "processing"
-            j.started_at = datetime.utcnow()
-            j.error = None
-            j.errors_json = None
-            j.vector_ids_json = None
-            j.chunk_ids_json = None
-            j.num_chunks_total = None
-            j.num_chunks_success = None
-            j.num_summary_docs = None
-            j.num_chunk_docs = None
-            j.num_embeddings = None
-            j.embedding_model = None
-            db_local.commit()
-
-            if not _init_pipeline_if_needed(force=False):
-                raise RuntimeError(f"Pipeline not initialized: {pipeline_init_error or 'Unknown initialization error'}")
-
-            get_logger("ingest").info("ingest_job_start", extra={"job_id": job_id, "file_path": j.file_path, "role": j.role})
-            result = pipeline.process_and_ingest(j.file_path, j.role, job_id=str(job_id))
-            vector_ids = result.get("vector_ids") if isinstance(result, dict) else []
-            chunk_ids = result.get("chunk_ids") if isinstance(result, dict) else []
-            errors = result.get("errors") if isinstance(result, dict) else []
-
-            j.status = "success"
-            j.finished_at = datetime.utcnow()
-            j.num_chunks_total = int(result.get("num_chunks_total") or 0) if isinstance(result, dict) else None
-            j.num_chunks_success = int(result.get("num_chunks_success") or 0) if isinstance(result, dict) else None
-            j.num_summary_docs = int(result.get("num_summary_docs") or 0) if isinstance(result, dict) else None
-            j.num_chunk_docs = int(result.get("num_chunk_docs") or 0) if isinstance(result, dict) else None
-            j.num_embeddings = (j.num_summary_docs or 0) + (j.num_chunk_docs or 0)
-            j.embedding_model = str(result.get("embedding_model") or "") if isinstance(result, dict) else None
-            j.vector_ids_json = json.dumps(vector_ids or [])
-            j.chunk_ids_json = json.dumps(chunk_ids or [])
-            j.errors_json = json.dumps(errors or [])
-            db_local.commit()
-            get_logger("ingest").info("ingest_job_success", extra={"job_id": job_id, "num_chunks_total": j.num_chunks_total, "num_chunks_success": j.num_chunks_success, "num_embeddings": j.num_embeddings})
-        except Exception as e:
-            get_logger("ingest").exception("ingest_job_failed", extra={"job_id": job_id})
-            try:
-                j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id).first()
-                if j:
-                    j.status = "error"
-                    j.finished_at = datetime.utcnow()
-                    j.error = f"{type(e).__name__}: {e}"
-                    j.errors_json = json.dumps([
-                        {"pipeline_none": pipeline is None, "pipeline_init_error": pipeline_init_error},
-                        traceback.format_exc(limit=12),
-                    ], ensure_ascii=False)
-                    db_local.commit()
-            except Exception:
-                pass
-        finally:
-            db_local.close()
-
-    background_tasks.add_task(_run_job, str(job.id))
+    ingest_queue.put(str(job.id))
     return {"success": True, "job": ingest_job_to_dict(job)}
 
 @app.get("/api/files/{file_name}")
@@ -1075,63 +1135,7 @@ def retry_ingest_job(job_id: str, background_tasks: BackgroundTasks, db: Session
     db.commit()
     db.refresh(new_job)
 
-    def _run_job(job_id2: str):
-        set_job_id(job_id2)
-        set_step("ingest_job_retry_run")
-        db_local = next(get_db())
-        try:
-            j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id2).first()
-            if not j:
-                return
-            j.status = "processing"
-            j.started_at = datetime.utcnow()
-            j.error = None
-            j.errors_json = None
-            j.vector_ids_json = None
-            j.chunk_ids_json = None
-            db_local.commit()
-
-            if not _init_pipeline_if_needed(force=False):
-                raise RuntimeError(f"Pipeline not initialized: {pipeline_init_error or 'Unknown initialization error'}")
-
-            get_logger("ingest").info("ingest_job_start", extra={"job_id": job_id2, "file_path": j.file_path, "role": j.role})
-            result = pipeline.process_and_ingest(j.file_path, j.role, job_id=str(job_id2))
-            vector_ids = result.get("vector_ids") if isinstance(result, dict) else []
-            chunk_ids = result.get("chunk_ids") if isinstance(result, dict) else []
-            errors = result.get("errors") if isinstance(result, dict) else []
-
-            j.status = "success"
-            j.finished_at = datetime.utcnow()
-            j.num_chunks_total = int(result.get("num_chunks_total") or 0) if isinstance(result, dict) else None
-            j.num_chunks_success = int(result.get("num_chunks_success") or 0) if isinstance(result, dict) else None
-            j.num_summary_docs = int(result.get("num_summary_docs") or 0) if isinstance(result, dict) else None
-            j.num_chunk_docs = int(result.get("num_chunk_docs") or 0) if isinstance(result, dict) else None
-            j.num_embeddings = (j.num_summary_docs or 0) + (j.num_chunk_docs or 0)
-            j.embedding_model = str(result.get("embedding_model") or "") if isinstance(result, dict) else None
-            j.vector_ids_json = json.dumps(vector_ids or [])
-            j.chunk_ids_json = json.dumps(chunk_ids or [])
-            j.errors_json = json.dumps(errors or [])
-            db_local.commit()
-            get_logger("ingest").info("ingest_job_success", extra={"job_id": job_id2, "num_chunks_total": j.num_chunks_total, "num_chunks_success": j.num_chunks_success, "num_embeddings": j.num_embeddings})
-        except Exception as e:
-            get_logger("ingest").exception("ingest_job_failed", extra={"job_id": job_id2})
-            try:
-                j = db_local.query(models.IngestJob).filter(models.IngestJob.id == job_id2).first()
-                if j:
-                    j.status = "error"
-                    j.finished_at = datetime.utcnow()
-                    j.error = f"{type(e).__name__}: {e}"
-                    j.errors_json = json.dumps([
-                        {"pipeline_none": pipeline is None, "pipeline_init_error": pipeline_init_error},
-                        traceback.format_exc(limit=12),
-                    ], ensure_ascii=False)
-                    db_local.commit()
-            except Exception:
-                pass
-        finally:
-            db_local.close()
-
-    background_tasks.add_task(_run_job, str(new_job.id))
+    ingest_queue.put(str(new_job.id))
     return {"success": True, "job": ingest_job_to_dict(new_job)}
 
 @app.post("/api/admin/ingest_jobs/{job_id}/rollback")
@@ -1153,6 +1157,15 @@ def rollback_ingest_job(job_id: str, db: Session = Depends(get_db)):
             pipeline.vectorstore.delete(ids=list(vector_ids))
         if chunk_ids and hasattr(pipeline, "retriever") and hasattr(pipeline.retriever, "docstore"):
             pipeline.retriever.docstore.mdelete(list(chunk_ids))
+            
+        # Dọn dẹp file vật lý khi rollback (nếu file vẫn còn sót lại do job thất bại giữa chừng)
+        try:
+            if os.path.exists(job.file_path):
+                os.remove(job.file_path)
+                get_logger("ingest").info("ingest_job_rollback_cleanup_success", extra={"job_id": job_id, "file_path": job.file_path})
+        except Exception as cleanup_err:
+            get_logger("ingest").warning("ingest_job_rollback_cleanup_failed", extra={"job_id": job_id, "file_path": job.file_path, "error": str(cleanup_err)})
+            
         job.status = "rolled_back"
         job.rolled_back_at = datetime.utcnow()
         db.commit()

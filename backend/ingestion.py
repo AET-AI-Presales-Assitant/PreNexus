@@ -7,11 +7,10 @@ from pydantic import BaseModel, Field
 
 # LangChain Imports
 from langchain_community.document_loaders import Docx2txtLoader, UnstructuredExcelLoader, TextLoader, UnstructuredPowerPointLoader
-from langchain_experimental.text_splitter import SemanticChunker
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_chroma import Chroma
 from langchain_classic.retrievers import MultiVectorRetriever
-from langchain_core.stores import InMemoryByteStore, ByteStore
+from langchain_core.stores import ByteStore
 from langchain_core.documents import Document
 
 import fitz  # PyMuPDF
@@ -20,9 +19,10 @@ import json
 import re
 import unicodedata
 import time
-import random
 from typing import Iterator, Sequence, Tuple
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from .settings import get_settings
 from .logger import get_logger, set_job_id, set_step
 
@@ -65,42 +65,25 @@ class LocalFileStore(ByteStore):
                 if prefix is None or key.startswith(prefix):
                     yield key
 
-try:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-except Exception:
-    RecursiveCharacterTextSplitter = None
-
 load_dotenv(find_dotenv(usecwd=True) or "", override=False)
 
+def _is_retryable_exception(e: Exception) -> bool:
+    msg = str(e or "").lower()
+    return ("resource_exhausted" in msg) or ("429" in msg) or ("rate limit" in msg) or ("quota" in msg)
+
 class _ThrottledEmbeddings:
-    def __init__(self, inner, batch_size: int = 8, max_retries: int = 5, base_sleep_s: float = 1.0):
+    def __init__(self, inner, batch_size: int = 8):
         self.inner = inner
         self.batch_size = max(1, int(batch_size))
-        self.max_retries = max(0, int(max_retries))
-        self.base_sleep_s = float(base_sleep_s)
 
-    def _is_retryable(self, e: Exception) -> bool:
-        msg = str(e or "")
-        m = msg.lower()
-        return ("resource_exhausted" in m) or ("429" in m) or ("rate limit" in m) or ("quota" in m)
-
-    def _sleep(self, attempt: int):
-        if self.base_sleep_s <= 0:
-            return
-        jitter = random.random() * 0.25
-        time.sleep(self.base_sleep_s * (2 ** max(0, attempt - 1)) + jitter)
-
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_exception),
+        reraise=True
+    )
     def _call_with_retry(self, fn):
-        last = None
-        for attempt in range(0, self.max_retries + 1):
-            try:
-                return fn()
-            except Exception as e:
-                last = e
-                if attempt >= self.max_retries or not self._is_retryable(e):
-                    raise
-                self._sleep(attempt + 1)
-        raise last  # type: ignore[misc]
+        return fn()
 
     def embed_documents(self, texts: List[str]):
         out = []
@@ -242,33 +225,12 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
     image_min_count = pdf_cfg.image_min_count
     max_vision_pages = pdf_cfg.max_vision_pages
     force_vision = pdf_cfg.force_vision
-    text_min_chars_text_dense = int(text_min_chars)
-    text_min_chars_image_dense = int(text_min_chars)
-    text_min_chars_mixed_image_text = int(text_min_chars)
-
-    sample_first_pages = max(0, min(pdf_cfg.sample_first_pages, page_count))
-    sample_force_vision = pdf_cfg.sample_force_vision
-    sample_disable_gain = pdf_cfg.sample_disable_gain_ratio
-    sample_enable_gain = pdf_cfg.sample_enable_gain_ratio
-    sample_text_multiplier = pdf_cfg.sample_text_min_chars_multiplier
-    sample_struct_desc_min = pdf_cfg.sample_struct_desc_min_chars
-    mixed_image_text_compact_min = pdf_cfg.mixed_image_text_min_chars
-    mixed_image_text_multiplier = pdf_cfg.mixed_image_text_multiplier
-    img_area_ratio_icon_max = pdf_cfg.img_area_ratio_icon_max
-    img_area_ratio_large_min = pdf_cfg.img_area_ratio_large_min
-    mixed_image_text_large_img_area_min = pdf_cfg.mixed_image_text_large_img_area_min
     drawings_min_count = pdf_cfg.drawings_min_count
-
-    vision_llm = None
     vision_pages_used = 0
-    sample_stats = {
-        "text_dense": {"seen": 0, "gain_sum": 0.0, "struct_hits": 0},
-        "image_only": {"seen": 0, "gain_sum": 0.0, "struct_hits": 0},
-        "mixed_image_text": {"seen": 0, "gain_sum": 0.0, "struct_hits": 0},
-    }
-    sample_adjusted = False
+    import concurrent.futures
 
-    for page_num in range(page_count):
+    def _process_page(page_num: int):
+        nonlocal vision_pages_used
         fitz_page = doc_fitz.load_page(page_num)
         text_raw = ""
         try:
@@ -317,37 +279,21 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
                 if area_sum > 0:
                     img_area_ratio = min(1.0, max(0.0, area_sum / page_area))
 
-        in_sample = (page_num < sample_first_pages) and (not sample_adjusted)
+        # Giả định luôn luôn dùng vision nếu thỏa mãn điều kiện cơ bản (bỏ qua logic sampling phức tạp cũ)
         image_trigger = (img_count >= image_min_count) and (img_count > 0)
         has_visual = (img_count > 0) or (drawings_count >= drawings_min_count)
-        mixed_cutoff = max(int(mixed_image_text_compact_min), int(float(text_min_chars_image_dense) * float(mixed_image_text_multiplier)))
-        if img_count > 0 and img_area_ratio <= img_area_ratio_icon_max:
-            page_group = "text_dense"
-        elif img_count > 0 and text_compact_len >= mixed_cutoff:
-            page_group = "mixed_image_text"
-        elif img_count > 0:
-            page_group = "image_only"
-        else:
-            page_group = "text_dense"
-
-        if force_vision:
+        
+        use_vision = False
+        if force_vision or has_visual or (img_count > 0 and text_compact_len < text_min_chars):
             use_vision = True
-        else:
-            if page_group == "image_only":
-                use_vision = (text_compact_len < text_min_chars_image_dense) or (image_trigger and text_compact_len < (text_min_chars_image_dense * 2))
-            elif page_group == "mixed_image_text":
-                use_vision = (text_compact_len < text_min_chars_mixed_image_text) or (image_trigger and img_area_ratio >= mixed_image_text_large_img_area_min)
-            else:
-                use_vision = (text_compact_len < text_min_chars_text_dense)
+            
         if use_vision and max_vision_pages == 0:
             use_vision = False
-        if use_vision and vision_pages_used >= max_vision_pages:
-            use_vision = False
-        if (not force_vision) and in_sample and sample_force_vision and max_vision_pages > 0 and vision_pages_used < max_vision_pages:
-            use_vision = True
-        if has_visual:
-            use_vision = True
 
+        vision_text_raw = ""
+        vision_text_clean = ""
+        vision_obj: Optional[dict] = None
+        
         vision_prompt = """
             You are a document page vision extraction engine. Analyze the page visually.
 
@@ -374,32 +320,30 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
             - full_description: describe layout/sections and table headers; if flow/tree, write parent -> children explicitly.
             - If unsure: use null/empty list/empty string. Never output non-JSON.
         """
-
-        vision_text_raw = ""
-        vision_text_clean = ""
-        vision_obj: Optional[dict] = None
+        
         if use_vision:
             try:
-                if vision_llm is None:
-                    api_key = os.getenv("GEMINI_API_KEY")
-                    if api_key:
-                        vision_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0, api_key=api_key)
-                    else:
-                        vision_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0)
-
+                local_vision_llm = llm
                 pix = fitz_page.get_pixmap(matrix=fitz.Matrix(2, 2))
                 img_bytes = pix.tobytes("png")
                 img_base64 = base64.b64encode(img_bytes).decode("utf-8")
-                time.sleep(4) # Rate limit protection for Gemini free tier
-                vision_msg = vision_llm.invoke(
-                    [
-                        {"role": "user", "content": [
-                            {"type": "text", "text": vision_prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
-                        ]}
-                    ]
+                @retry(
+                    stop=stop_after_attempt(5),
+                    wait=wait_exponential(multiplier=1, min=1, max=10),
+                    retry=retry_if_exception(_is_retryable_exception),
+                    reraise=True
                 )
-                vision_pages_used += 1
+                def invoke_vision_summary():
+                    return local_vision_llm.invoke(
+                        [
+                            {"role": "user", "content": [
+                                {"type": "text", "text": vision_prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
+                            ]}
+                        ]
+                    )
+
+                vision_msg = invoke_vision_summary()
                 vision_text_raw = _coerce_vision_content_to_text(vision_msg.content)
                 vision_text_clean = _strip_code_fences(vision_text_raw)
                 vision_obj = _try_parse_json(vision_text_clean)
@@ -420,49 +364,6 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
             vision_obj_storage.pop("page_ocr_text", None)
             vision_json_text = json.dumps(vision_obj_storage, ensure_ascii=False)
 
-        if in_sample:
-            if vision_ocr_text:
-                base = max(1, text_compact_len)
-                vlen = len(re.sub(r"\s+", "", vision_ocr_text))
-                if vlen > 0:
-                    sample_stats[page_group]["seen"] += 1
-                    sample_stats[page_group]["gain_sum"] += (float(vlen) / float(base))
-                    ctype = str((vision_obj or {}).get("content_type") or "").strip().lower()
-                    if ctype in {"diagram", "table", "mixed"}:
-                        sample_stats[page_group]["struct_hits"] += 1
-                    elif vision_full_description and len(vision_full_description) >= sample_struct_desc_min:
-                        sample_stats[page_group]["struct_hits"] += 1
-
-            if (page_num + 1) >= sample_first_pages and (not sample_adjusted):
-                totals_seen = int(sample_stats["text_dense"]["seen"]) + int(sample_stats["image_only"]["seen"]) + int(sample_stats["mixed_image_text"]["seen"])
-                totals_struct = int(sample_stats["text_dense"]["struct_hits"]) + int(sample_stats["image_only"]["struct_hits"]) + int(sample_stats["mixed_image_text"]["struct_hits"])
-                totals_gain_sum = float(sample_stats["text_dense"]["gain_sum"]) + float(sample_stats["image_only"]["gain_sum"]) + float(sample_stats["mixed_image_text"]["gain_sum"])
-                if totals_seen > 0:
-                    avg_gain_all = totals_gain_sum / float(totals_seen)
-                    if (avg_gain_all <= sample_disable_gain) and (totals_struct == 0):
-                        max_vision_pages = vision_pages_used
-
-                for grp, v in sample_stats.items():
-                    seen = int(v["seen"])
-                    if seen <= 0:
-                        continue
-                    avg_gain = float(v["gain_sum"]) / float(seen)
-                    struct_hits = int(v["struct_hits"])
-                    if grp == "text_dense":
-                        if (avg_gain <= sample_disable_gain) and (struct_hits == 0):
-                            text_min_chars_text_dense = max(int(float(text_min_chars_text_dense) / max(1.0, float(sample_text_multiplier))), 50)
-                        elif (avg_gain >= sample_enable_gain) or (struct_hits > 0):
-                            text_min_chars_text_dense = min(int(float(text_min_chars_text_dense) * float(sample_text_multiplier)), 2000)
-                    elif grp == "image_only":
-                        if (avg_gain <= sample_disable_gain) and (struct_hits == 0):
-                            text_min_chars_image_dense = max(int(float(text_min_chars_image_dense) / max(1.0, float(sample_text_multiplier))), 80)
-                        elif (avg_gain >= sample_enable_gain) or (struct_hits > 0):
-                            text_min_chars_image_dense = min(int(float(text_min_chars_image_dense) * float(sample_text_multiplier)), 2000)
-                    else:
-                        if (avg_gain <= sample_disable_gain) and (struct_hits == 0):
-                            text_min_chars_mixed_image_text = max(int(float(text_min_chars_mixed_image_text) / max(1.0, float(sample_text_multiplier))), 120)
-                sample_adjusted = True
-
         extracted_best = vision_ocr_text
         if not extracted_best:
             extracted_best = vision_full_description if has_visual else text_norm
@@ -474,10 +375,29 @@ def process_pdf_complex(file_path: str, llm, max_pages: Optional[int] = None) ->
         combined_content += "[Vision JSON]:\n"
         combined_content += f"{vision_json_text or vision_text_clean or vision_text_raw}\n"
 
-        docs.append(Document(
+        return Document(
             page_content=combined_content,
             metadata={"source": file_path, "page": page_num + 1}
-        ))
+        )
+
+    # Chạy song song quá trình OCR các trang (tối đa 5-10 trang cùng lúc)
+    MAX_CONCURRENT_PAGES = int(os.getenv("VISION_CONCURRENCY", "5"))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PAGES) as executor:
+        future_to_page = {executor.submit(_process_page, page_num): page_num for page_num in range(page_count)}
+        
+        results = [None] * page_count
+        for future in concurrent.futures.as_completed(future_to_page):
+            page_num = future_to_page[future]
+            try:
+                doc = future.result()
+                results[page_num] = doc
+            except Exception as exc:
+                log.exception("page_processing_failed", extra={"page": page_num, "error": str(exc)})
+                
+        # Lọc ra các trang hợp lệ và theo đúng thứ tự
+        for doc in results:
+            if doc is not None:
+                docs.append(doc)
     doc_fitz.close()
     return docs
 
@@ -523,6 +443,11 @@ class ChunkClassification(BaseModel):
     key_points: List[str] = Field(description="3-7 key points, each is a short sentence")
     summary: str = Field(description="1-3 sentence summary that is good for semantic search")
 
+class BatchContextualChunkClassification(BaseModel):
+    results: List[ChunkClassification] = Field(description="A list of classifications, exactly matching the order and number of the input chunks.")
+
+
+
 class KnowledgePipeline:
     def __init__(self, api_key: str):
         settings = get_settings()
@@ -556,13 +481,10 @@ class KnowledgePipeline:
             id_key=self.id_key,
         )
         
-        if RecursiveCharacterTextSplitter is not None:
-            self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=settings.chunking.chunk_size,
-                chunk_overlap=settings.chunking.chunk_overlap,
-            )
-        else:
-            self.text_splitter = SemanticChunker(self.embeddings, breakpoint_threshold_type="percentile")
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.chunking.chunk_size,
+            chunk_overlap=settings.chunking.chunk_overlap,
+        )
 
     def process_and_ingest(self, file_path: str, role: str = "Employee", job_id: Optional[str] = None) -> dict:
         if job_id:
@@ -571,17 +493,55 @@ class KnowledgePipeline:
         log.info("ingest_read_file", extra={"file_path": file_path, "role": role})
         docs = load_file(file_path, self.llm)
         
-        # Combine all page contents into one full text for better semantic chunking.
-        full_text = "\n\n".join([d.page_content for d in docs])
+        # Lấy nội dung xem trước để tạo Document Summary (không lưu toàn bộ văn bản vào một biến lớn)
+        preview_text = ""
+        preview_chars_collected = 0
+        for d in docs:
+            if preview_chars_collected >= 30000:
+                break
+            content_len = len(d.page_content)
+            preview_text += d.page_content + "\n\n"
+            preview_chars_collected += content_len
         
         set_step("chunking")
         log.info("ingest_chunking_start")
-        chunks = self.text_splitter.create_documents([full_text])
+        # Thay vì truyền chuỗi lớn `full_text`, truyền thẳng danh sách các Document để tối ưu bộ nhớ
+        chunks = self.text_splitter.split_documents(docs)
         log.info("ingest_chunking_done", extra={"num_chunks_total": len(chunks)})
+        
+        set_step("document_summary")
+        log.info("ingest_document_summary_start")
+        document_summary = ""
+        try:
+            summary_preview = preview_text[:10000]
+            if summary_preview.strip():
+                @retry(
+                    stop=stop_after_attempt(5),
+                    wait=wait_exponential(multiplier=1, min=1, max=10),
+                    retry=retry_if_exception(_is_retryable_exception),
+                    reraise=True
+                )
+                def invoke_doc_summary():
+                    doc_summary_prompt = f"""You are an expert summarizer. Please read the following beginning of a document and provide a concise 1-2 sentence overall summary of what this document is about.
+                    Do not include secrets/PII. 
+                    
+                    DOCUMENT PREVIEW:
+                    {summary_preview}
+                    """
+                    return self.llm.invoke(doc_summary_prompt)
+
+                doc_summary_response = invoke_doc_summary()
+                document_summary = str(doc_summary_response.content).strip()
+                log.info("ingest_document_summary_done", extra={"summary": document_summary})
+                
+                # CHÚ Ý: KHÔNG Gắn Ngữ cảnh Toàn cục vào đầu mỗi chunk ở đây.
+                # Việc gắn vào đây sẽ khiến prompt bị nhiễu, LLM sẽ lặp lại cùng một câu trả lời cho các chunk.
+        except Exception as e:
+            log.warning("ingest_document_summary_failed", extra={"error": str(e)})
         
         set_step("metadata_llm")
         log.info("ingest_metadata_llm_start")
-        structured_llm = self.llm.with_structured_output(ChunkClassification)
+        structured_llm = self.llm.with_structured_output(BatchContextualChunkClassification)
         
         doc_ids = [str(uuid.uuid4()) for _ in chunks]
         created_at_ms = int(time.time() * 1000)
@@ -589,79 +549,128 @@ class KnowledgePipeline:
         summary_ids = []
         errors = []
         
-        for i, chunk in enumerate(chunks):
+        batch_size = 20
+        
+        @retry(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, min=1, max=10),
+            retry=retry_if_exception(_is_retryable_exception),
+            reraise=True
+        )
+        def invoke_batch_classification(prompt_text):
+            return structured_llm.invoke(prompt_text)
+        
+        for i in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            batch_doc_ids = doc_ids[i:i + batch_size]
             try:
-                set_step("metadata_llm_chunk")
-                time.sleep(4) # Rate limit protection for Gemini free tier (15 RPM)
-                analysis: ChunkClassification = structured_llm.invoke(
-                    f"""Analyze the following text for internal knowledge base ingestion.
-                    Rules:
-                    - Follow the schema strictly.
-                    - Do not include secrets/PII (API keys, passwords, tokens, personal emails/phones); replace with "[REDACTED]".
-
-                    TEXT:
-                    {chunk.page_content}"""
-                )
+                set_step("metadata_llm_batch")
                 
-                # Check if analysis is None or missing attributes
-                if not analysis:
-                    log.warning("ingest_llm_empty_analysis", extra={"chunk_index": i + 1})
+                batch_text = ""
+                for j, chunk in enumerate(batch_chunks):
+                    batch_text += f"--- CHUNK {j} ---\n{chunk.page_content}\n\n"
+                
+                # Cung cấp bối cảnh gốc dựa trên preview_text thay vì full_text để tránh tràn RAM
+                document_context_full = preview_text[:30000]
+                
+                prompt_text = f"""Analyze the following chunks of text for internal knowledge base ingestion.
+                    
+                    You are given the full document as context to understand what these chunks mean in the bigger picture.
+                    
+                    FULL DOCUMENT CONTEXT (or beginning part):
+                    {document_context_full}
+                    
+                    ---
+                    
+                    Rules:
+                    - Follow the schema strictly. Return a list of classifications exactly matching the number of chunks ({len(batch_chunks)}).
+                    - Order of the results MUST match the order of the input chunks.
+                    - Do not include secrets/PII (API keys, passwords, tokens, personal emails/phones); replace with "[REDACTED]".
+                    - The 'summary' field MUST be specific to the unique content of THIS specific chunk.
+                    - Explain how this specific information relates to the document context, DO NOT just summarize the whole document again.
+                    - CRITICAL: DO NOT return the same summary for different chunks. Each chunk must have its own distinct summary based on its content.
+
+                    CHUNKS TO ANALYZE:
+                    {batch_text}"""
+                
+                analysis_batch: BatchContextualChunkClassification = invoke_batch_classification(prompt_text)
+                
+                if not analysis_batch or not hasattr(analysis_batch, "results") or not analysis_batch.results:
+                    log.warning("ingest_llm_empty_analysis_batch", extra={"batch_start_index": i})
                     continue
 
-                chunk.metadata = {
-                    "source": file_path,
-                    "category": analysis.category,
-                    "tags": ", ".join(analysis.tags) if hasattr(analysis, "tags") else "",
-                    "chunk_title": analysis.title if hasattr(analysis, "title") else "",
-                    "role": role,
-                    "createdAt": created_at_ms,
-                    self.id_key: doc_ids[i]
-                }
+                for j, chunk in enumerate(batch_chunks):
+                    if j >= len(analysis_batch.results):
+                        log.warning("ingest_llm_missing_results_in_batch", extra={"batch_start_index": i, "chunk_index_in_batch": j})
+                        break
+                        
+                    analysis = analysis_batch.results[j]
+                    doc_id = batch_doc_ids[j]
 
-                tags = analysis.tags if hasattr(analysis, "tags") and isinstance(analysis.tags, list) else []
-                tag_tokens = []
-                for t in tags:
-                    ht = _to_ascii_hashtag(str(t))
-                    if ht:
-                        tag_tokens.append(f"#{ht}")
-                if analysis.category:
-                    tag_tokens.append(f"#{_to_ascii_hashtag(str(analysis.category))}")
-                hashtags = " ".join(dict.fromkeys(tag_tokens))
-
-                key_points = analysis.key_points if hasattr(analysis, "key_points") and isinstance(analysis.key_points, list) else []
-                key_points_text = "\n".join([f"- {str(p).strip()}" for p in key_points if str(p).strip()])
-
-                chunk_title = analysis.title.strip() if hasattr(analysis, "title") and isinstance(analysis.title, str) else ""
-                if not chunk_title:
-                    chunk_title = os.path.basename(file_path)
-
-                summary_text = analysis.summary.strip() if hasattr(analysis, "summary") and isinstance(analysis.summary, str) else ""
-                if not summary_text:
-                    summary_text = (chunk.page_content or "")[:400]
-
-                display_content = f"{chunk_title}\n{hashtags}\n\n{summary_text}".strip()
-                if key_points_text:
-                    display_content += f"\n\nKey points:\n{key_points_text}"
-
-                summary_doc = Document(
-                    page_content=display_content,
-                    metadata={
-                        self.id_key: doc_ids[i],
-                        "category": analysis.category,
-                        "tags": ", ".join(tags),
-                        "chunk_title": chunk_title,
+                    chunk.metadata = {
                         "source": file_path,
+                        "category": analysis.category,
+                        "tags": ", ".join(analysis.tags) if hasattr(analysis, "tags") else "",
+                        "chunk_title": analysis.title if hasattr(analysis, "title") else "",
                         "role": role,
-                        "createdAt": created_at_ms
+                        "createdAt": created_at_ms,
+                        self.id_key: doc_id
                     }
-                )
-                summary_docs.append(summary_doc)
-                summary_ids.append(doc_ids[i])
+
+                    tags = analysis.tags if hasattr(analysis, "tags") and isinstance(analysis.tags, list) else []
+                    tag_tokens = []
+                    for t in tags:
+                        ht = _to_ascii_hashtag(str(t))
+                        if ht:
+                            tag_tokens.append(f"#{ht}")
+                    if analysis.category:
+                        tag_tokens.append(f"#{_to_ascii_hashtag(str(analysis.category))}")
+                    hashtags = " ".join(dict.fromkeys(tag_tokens))
+
+                    key_points = analysis.key_points if hasattr(analysis, "key_points") and isinstance(analysis.key_points, list) else []
+                    key_points_text = "\n".join([f"- {str(p).strip()}" for p in key_points if str(p).strip()])
+
+                    chunk_title = analysis.title.strip() if hasattr(analysis, "title") and isinstance(analysis.title, str) else ""
+                    if not chunk_title:
+                        chunk_title = os.path.basename(file_path)
+
+                    summary_text = analysis.summary.strip() if hasattr(analysis, "summary") and isinstance(analysis.summary, str) else ""
+                    if not summary_text:
+                        summary_text = (chunk.page_content or "")[:400]
+
+                    display_content = ""
+                    if document_summary:
+                        display_content += f"[Document Context: {document_summary}]\n\n"
+                    display_content += f"{chunk_title}\n{hashtags}\n\n{summary_text}".strip()
+                    if key_points_text:
+                        display_content += f"\n\nKey points:\n{key_points_text}"
+
+                    summary_doc = Document(
+                        page_content=display_content,
+                        metadata={
+                            self.id_key: doc_id,
+                            "category": analysis.category,
+                            "tags": ", ".join(tags),
+                            "chunk_title": chunk_title,
+                            "source": file_path,
+                            "role": role,
+                            "createdAt": created_at_ms
+                        }
+                    )
+                    summary_docs.append(summary_doc)
+                    summary_ids.append(doc_id)
 
             except Exception as e:
-                log.exception("ingest_chunk_failed", extra={"chunk_index": i + 1})
+                log.exception("ingest_batch_failed", extra={"batch_start_index": i})
                 errors.append(str(e))
-                
+
+        # Chỉ gắn Ngữ cảnh Toàn cục vào đầu các chunk SAU KHI đã chạy xong LLM metadata 
+        # (Để lưu vào ByteStore và trả về trong Document Viewer)
+        if document_summary:
+            for c in chunks:
+                if not c.page_content.startswith("[Document Context:"):
+                    c.page_content = f"[Document Context: {document_summary}]\n\n{c.page_content}"
+
         set_step("save_chroma")
         log.info("ingest_save_chroma_start")
         # Lưu Full Text vào ByteStore

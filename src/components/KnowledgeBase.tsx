@@ -397,9 +397,19 @@ export function KnowledgeBase({
                   </h3>
                   
                   {/* Content preview */}
-                  <p className="text-[13px] text-neutral-500 line-clamp-3 mb-4 flex-1">
-                    {doc.content.replace(/\*\*/g, '')}
-                  </p>
+                <p className="text-[13px] text-neutral-500 line-clamp-3 mb-4 flex-1">
+                  {(() => {
+                    const content = doc.content;
+                    const match = content.match(/#\w+\s*$/m) || content.match(/#\w+(?!.*#\w+)/s);
+                    if (match) {
+                      const lastTagIndex = content.lastIndexOf(match[0]) + match[0].length;
+                      const textResult = content.substring(lastTagIndex).trim();
+                      
+                      return <span className="font-semibold text-neutral-700">{textResult}</span>;
+                    }
+                    return content.replace(/\*\*/g, '');
+                  })()}
+                </p>
 
                   {/* Tags */}
                   <div className="flex flex-wrap gap-2 mb-6">
@@ -472,7 +482,26 @@ export function KnowledgeBase({
               </div>
               
               <div className="prose prose-sm md:prose-base max-w-none text-neutral-600 whitespace-pre-wrap">
-                {selectedDoc.content}
+                {(() => {
+                  const content = selectedDoc.content;
+                  const match = content.match(/#\w+\s*$/m) || content.match(/#\w+(?!.*#\w+)/s);
+
+                  if (match) {
+                    // Lấy vị trí kết thúc của hashtag cuối cùng
+                    const lastTagIndex = content.lastIndexOf(match[0]) + match[0].length;
+                    
+                    // Cắt chuỗi từ sau hashtag đó và xóa khoảng trắng thừa ở 2 đầu
+                    const textResult = content.substring(lastTagIndex).trim();
+
+                    return (
+                      <>
+                        <div>
+                          {textResult}
+                        </div>
+                      </>
+                    );
+                  }
+                })()}
               </div>
             </div>
           </div>

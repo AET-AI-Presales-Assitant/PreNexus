@@ -238,7 +238,7 @@ export function ImportData({ onImport }: ImportDataProps) {
                       <p className="text-neutral-500 mb-6 max-w-sm">
                           Drag and drop your file here, or click to browse.
                           <br />
-                          <span className="text-xs">Supports PDF, TXT, MD, JSON, Images</span>
+                          <span className="text-xs">Supports PDF, TXT, MD, JSON, Images, PowerPoint</span>
                       </p>
                       
                       <input 
@@ -246,7 +246,7 @@ export function ImportData({ onImport }: ImportDataProps) {
                           id="file-upload" 
                           className="hidden" 
                           onChange={handleFileChange}
-                          accept=".pdf,.txt,.md,.json,.jpg,.jpeg,.png"
+                          accept=".pdf,.txt,.md,.json,.jpg,.jpeg,.png,.ppt,.pptx"
                       />
                       <label 
                           htmlFor="file-upload"

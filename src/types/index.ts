@@ -57,4 +57,6 @@ export interface AnalyticsQuery {
   userRole: string;
   sessionTitle: string;
   answerContent?: string;
+  feedbackValue?: number;
+  feedbackNote?: string;
 }
