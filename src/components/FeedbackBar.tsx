@@ -10,6 +10,12 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./ui/tooltip";
 
 type ReportKind = 'citation_not_relevant' | 'hallucination_report';
 
@@ -27,7 +33,7 @@ function safeUserId() {
 export function FeedbackBar({ message }: { message: Message }) {
   const userId = useMemo(() => safeUserId(), []);
   const [sending, setSending] = useState(false);
-  const [thumb, setThumb] = useState<1 | -1 | 0>(message.thumb || 0);
+  const [thumb, setThumb] = useState<1 | -1 | 2 | 0>(message.thumb || 0);
 
   useEffect(() => {
     setThumb(message.thumb || 0);
@@ -109,6 +115,7 @@ export function FeedbackBar({ message }: { message: Message }) {
       }
     });
     if (ok) {
+      setThumb(2); // Dùng thumb=2 để đánh dấu đã report
       setReportOpen(false);
       setNote('');
       setSelectedCitationIds({});
@@ -132,67 +139,89 @@ export function FeedbackBar({ message }: { message: Message }) {
   if (isNoData(message.content)) return null;
 
   return (
-    <div className="mt-2 flex items-center gap-2">
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="h-7 px-2 text-xs"
-        disabled={!canSend || sending || thumb === 1}
-        onClick={() => sendThumb(1)}
-      >
-        <ThumbsUp className="w-3.5 h-3.5 mr-1" />
-        Helpful
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="h-7 px-2 text-xs"
-        disabled={!canSend || sending || thumb === -1}
-        onClick={() => sendThumb(-1)}
-      >
-        <ThumbsDown className="w-3.5 h-3.5 mr-1" />
-        Not helpful
-      </Button>
+    <TooltipProvider>
+      <div className="mt-2 flex items-center gap-1.5 opacity-80 hover:opacity-100 transition-opacity">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className={`h-8 w-8 p-0 rounded-full transition-colors ${thumb === 1 ? 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100' : 'text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800'}`}
+              disabled={!canSend || sending || thumb === 1}
+              onClick={() => sendThumb(1)}
+            >
+              <ThumbsUp className={`w-4 h-4 ${thumb === 1 ? 'fill-emerald-600' : ''}`} />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs bg-neutral-800 text-white border-neutral-700">
+            Helpful
+          </TooltipContent>
+        </Tooltip>
 
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-xs"
-            disabled={!canSend || sending}
-          >
-            <Flag className="w-3.5 h-3.5 mr-1" />
-            Report
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-56">
-          <DropdownMenuItem
-            onClick={(e) => {
-              e.stopPropagation();
-              setReportKind('citation_not_relevant');
-              setReportOpen(true);
-            }}
-          >
-            Citation not relevant
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onClick={(e) => {
-              e.stopPropagation();
-              setReportKind('hallucination_report');
-              setReportOpen(true);
-            }}
-          >
-            Hallucination report
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className={`h-8 w-8 p-0 rounded-full transition-colors ${thumb === -1 ? 'bg-rose-50 text-rose-600 hover:bg-rose-100' : 'text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800'}`}
+              disabled={!canSend || sending || thumb === -1}
+              onClick={() => sendThumb(-1)}
+            >
+              <ThumbsDown className={`w-4 h-4 ${thumb === -1 ? 'fill-rose-600' : ''}`} />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="text-xs bg-neutral-800 text-white border-neutral-700">
+            Not helpful
+          </TooltipContent>
+        </Tooltip>
 
-      <Dialog open={reportOpen} onOpenChange={setReportOpen}>
-        <DialogContent className="bg-white rounded-2xl w-full max-w-2xl h-[75vh] flex flex-col shadow-2xl overflow-hidden p-0">
+        <DropdownMenu>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className={`h-8 w-8 p-0 rounded-full transition-colors ${thumb === 2 ? 'bg-amber-50 text-amber-600 hover:bg-amber-100' : 'text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800'}`}
+                  disabled={!canSend || sending || thumb === 2}
+                >
+                  <Flag className={`w-4 h-4 ${thumb === 2 ? 'fill-amber-600' : ''}`} />
+                </Button>
+              </DropdownMenuTrigger>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="text-xs bg-neutral-800 text-white border-neutral-700">
+              Report issue
+            </TooltipContent>
+          </Tooltip>
+          <DropdownMenuContent align="start" className="w-56 bg-white border-neutral-200 shadow-lg rounded-xl p-1">
+            <DropdownMenuItem
+              className="text-sm cursor-pointer hover:bg-neutral-50 focus:bg-neutral-50 rounded-lg p-2"
+              onClick={(e) => {
+                e.stopPropagation();
+                setReportKind('citation_not_relevant');
+                setReportOpen(true);
+              }}
+            >
+              Citation not relevant
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="text-sm cursor-pointer hover:bg-neutral-50 focus:bg-neutral-50 rounded-lg p-2"
+              onClick={(e) => {
+                e.stopPropagation();
+                setReportKind('hallucination_report');
+                setReportOpen(true);
+              }}
+            >
+              Hallucination report
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <Dialog open={reportOpen} onOpenChange={setReportOpen}>
+          <DialogContent className="bg-white rounded-2xl w-full max-w-2xl h-[75vh] flex flex-col shadow-2xl overflow-hidden p-0">
           <div className="p-4 border-b border-neutral-100 bg-neutral-50 shrink-0">
             <div className="text-lg font-semibold text-neutral-900">
               {reportKind === 'citation_not_relevant' ? 'Citation not relevant' : 'Hallucination report'}
@@ -261,17 +290,17 @@ export function FeedbackBar({ message }: { message: Message }) {
             </Button>
             <Button
               type="button"
-              variant="default"
+              className="h-9 bg-indigo-600 hover:bg-indigo-700 text-white"
               size="sm"
-              className="h-9"
               onClick={submitReport}
               disabled={!canSend || sending}
             >
-              Submit
+              Submit Report
             </Button>
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+      </div>
+    </TooltipProvider>
   );
 }

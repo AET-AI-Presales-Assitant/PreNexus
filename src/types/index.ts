@@ -12,7 +12,14 @@ export interface Session {
   id: string;
   userId: string;
   title: string;
+  workspaceId?: string | null;
   createdAt: number;
+}
+
+export interface Workspace {
+  id: string;
+  name: string;
+  createdAt: string;
 }
 
 export interface Message {

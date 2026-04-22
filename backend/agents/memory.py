@@ -6,7 +6,7 @@ from langchain_core.documents import Document
 from .. import models
 from ..database import get_db
 from ..ingestion import KnowledgePipeline
-from .common import coerce_llm_content_to_text, role_level
+from .common import coerce_llm_content_to_text, role_level, normalize_for_match
 
 
 def format_history_lines(messages: List[models.Message]) -> str:
@@ -18,23 +18,74 @@ def format_history_lines(messages: List[models.Message]) -> str:
 
 
 def build_history_text(db: Session, req, lang: str) -> str:
+    exact_match_constraints = []
+    general_negative_constraints = []
+    
     if getattr(req, "sessionId", None):
+        current_query = getattr(req, "message", "")
+        current_norm = normalize_for_match(current_query)
+        
         try:
-            recent = (
+            # Lấy toàn bộ tin nhắn trong session để kiểm tra vòng lặp câu hỏi - câu trả lời
+            all_msgs = (
                 db.query(models.Message)
                 .filter(models.Message.session_id == req.sessionId)
-                .order_by(models.Message.created_at.desc())
-                .limit(16)
+                .order_by(models.Message.created_at.asc())
                 .all()
             )
-            recent = list(reversed(recent))
+            
+            # 1. Tìm xem người dùng đã từng hỏi CÂU HỎI Y HỆT NÀY và chê câu trả lời chưa
+            for i in range(len(all_msgs) - 1):
+                if all_msgs[i].role == "user" and all_msgs[i+1].role == "agent":
+                    prev_query = all_msgs[i].content or ""
+                    # Nếu câu hỏi cũ giống hệt câu hiện tại
+                    if normalize_for_match(prev_query) == current_norm:
+                        agent_msg = all_msgs[i+1]
+                        feedback = db.query(models.Feedback).filter(models.Feedback.message_id == agent_msg.id, models.Feedback.value.in_([-1, 2])).first()
+                        if feedback:
+                            note_text = f" (User note: {feedback.note})" if feedback.note else ""
+                            exact_match_constraints.append(f"PREVIOUS BAD ANSWER: {agent_msg.content}{note_text}")
+
+            # 2. Lấy 16 tin nhắn gần nhất để làm ngữ cảnh trò chuyện (như cũ)
+            recent = all_msgs[-16:] if len(all_msgs) > 16 else all_msgs
+            
+            # 3. Lọc thêm các tin nhắn AI bị đánh giá Unhelpful gần đây (nếu không nằm trong exact_match)
+            for m in recent:
+                if m.role == "agent":
+                    feedback = db.query(models.Feedback).filter(models.Feedback.message_id == m.id, models.Feedback.value.in_([-1, 2])).first()
+                    if feedback:
+                        note_text = f" (User note: {feedback.note})" if feedback.note else ""
+                        constraint_str = f"PREVIOUS BAD ANSWER: {m.content}{note_text}"
+                        if constraint_str not in exact_match_constraints:
+                            general_negative_constraints.append(constraint_str)
+                        
             sm = db.query(models.SessionMemory).filter(models.SessionMemory.session_id == req.sessionId).first()
             summary = (sm.summary or "").strip() if sm else ""
             recent_text = format_history_lines(recent)
+            
+            result_text = ""
             if summary:
-                return f"SESSION SUMMARY:\n{summary}\n\nRECENT MESSAGES:\n{recent_text}"
-            return recent_text
-        except Exception:
+                result_text = f"SESSION SUMMARY:\n{summary}\n\nRECENT MESSAGES:\n{recent_text}"
+            else:
+                result_text = recent_text
+                
+            # Chèn constraints vào cuối history để AI chú ý nhất
+            if exact_match_constraints or general_negative_constraints:
+                constraints_text = "\n\nCRITICAL CONSTRAINTS FROM USER FEEDBACK:\n"
+                
+                if exact_match_constraints:
+                    constraints_text += "The user has asked this EXACT SAME question before and marked your previous answers as unhelpful or incorrect. You MUST provide a COMPLETELY DIFFERENT, BETTER, or CORRECTED answer. Do NOT repeat these mistakes:\n"
+                    constraints_text += "\n---\n".join(exact_match_constraints) + "\n\n"
+                    
+                if general_negative_constraints:
+                    constraints_text += "The user also marked these recent answers as unhelpful. Keep this in mind to avoid similar mistakes:\n"
+                    constraints_text += "\n---\n".join(general_negative_constraints[-2:]) # Chỉ lấy 2 feedback chung gần nhất để tránh loãng
+                    
+                result_text += constraints_text
+                
+            return result_text
+        except Exception as e:
+            print(f"Error building history text: {e}")
             pass
 
     hist = getattr(req, "history", None)

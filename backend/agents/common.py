@@ -85,9 +85,9 @@ def i18n(lang: str) -> dict:
 
 def normalize_for_match(text: str) -> str:
     t = (text or "").lower()
-    t = unicodedata.normalize("NFKD", t)
-    t = t.encode("ascii", "ignore").decode("ascii")
-    t = re.sub(r"[^a-z0-9]+", " ", t)
+    t = unicodedata.normalize("NFC", t)
+    # Giữ lại chữ cái (kể cả tiếng Việt), số và khoảng trắng
+    t = re.sub(r"[^\w\s]+", " ", t)
     return t.strip()
 
 

@@ -93,8 +93,8 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [activePage, setActivePage] = useState<number | null>(null);
   
-  const [filterCategory, setFilterCategory] = useState<string>('All');
-  const [filterRole, setFilterRole] = useState<string>('All');
+  const [filterCategory] = useState<string>('All');
+  const [filterRole] = useState<string>('All');
 
   if (!Array.isArray(citations) || citations.length === 0) return null;
 
@@ -133,10 +133,6 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
   const pdfFiles = allFiles.filter(f => f.toLowerCase().endsWith('.pdf'));
   const filesToShow = pdfFiles.length > 0 ? pdfFiles : allFiles;
 
-  // Extract unique categories and roles for filters
-  const categories = Array.from(new Set(citations.map(c => c.category).filter(Boolean)));
-  const roles = Array.from(new Set(citations.map(c => c.role).filter(Boolean)));
-
   const openPdf = (fileName: string, page?: number | null, snippet?: string) => {
     let url = apiUrl(`/files/${encodeURIComponent(fileName)}`);
     const hashParams = [];
@@ -154,33 +150,6 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
   return (
     <div className="mt-4">
       <div className="text-[11px] font-bold text-neutral-500 tracking-wider uppercase mb-2">Knowledge sources used</div>
-      
-      {/* Filters */}
-      {(categories.length > 1 || roles.length > 1) && (
-        <div className="flex gap-2 mb-3">
-          {categories.length > 1 && (
-            <select 
-              className="text-xs border-neutral-200 rounded-md bg-white/60 px-2 py-1"
-              value={filterCategory}
-              onChange={(e) => setFilterCategory(e.target.value)}
-            >
-              <option value="All">All Categories</option>
-              {categories.map(c => <option key={c} value={c}>{c}</option>)}
-            </select>
-          )}
-          {roles.length > 1 && (
-            <select 
-              className="text-xs border-neutral-200 rounded-md bg-white/60 px-2 py-1"
-              value={filterRole}
-              onChange={(e) => setFilterRole(e.target.value)}
-            >
-              <option value="All">All Roles</option>
-              {roles.map(r => <option key={r} value={r}>{r}</option>)}
-            </select>
-          )}
-        </div>
-      )}
-
       <div className="space-y-2">
         {filesToShow.map((f) => (
           <div key={f} className="flex items-center gap-3 bg-white/60 border border-neutral-200 rounded-xl px-3 py-2">
@@ -210,12 +179,6 @@ function SourcesUsed({ citations, usedDocs }: { citations: any[]; usedDocs?: any
         <DialogContent className={`bg-white rounded-2xl w-full ${isSelectedPdf ? 'max-w-6xl' : 'max-w-3xl'} h-[85vh] flex flex-col shadow-2xl overflow-hidden p-0`}>
           <div className="flex items-center justify-between p-4 border-b border-neutral-100 bg-neutral-50 shrink-0">
             <div className="text-lg font-semibold text-neutral-900 truncate">{selectedFile || 'Source'}</div>
-            {isSelectedPdf ? (
-              <Button variant="outline" size="sm" className="h-9" onClick={() => openPdf(selectedFile, activePage)}>
-                <ExternalLink className="w-4 h-4 mr-2" />
-                Open PDF
-              </Button>
-            ) : null}
           </div>
 
           <div className="flex-1 flex overflow-hidden">

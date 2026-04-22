@@ -110,14 +110,6 @@ def _run_ingest_job(job_id: str):
         db_local.commit()
         get_logger("ingest").info("ingest_job_success", extra={"job_id": job_id, "num_chunks_total": j.num_chunks_total, "num_chunks_success": j.num_chunks_success, "num_embeddings": j.num_embeddings})
         
-        # Dọn dẹp file vật lý sau khi xử lý thành công
-        try:
-            if os.path.exists(j.file_path):
-                os.remove(j.file_path)
-                get_logger("ingest").info("ingest_job_cleanup_success", extra={"job_id": job_id, "file_path": j.file_path})
-        except Exception as cleanup_err:
-            get_logger("ingest").warning("ingest_job_cleanup_failed", extra={"job_id": job_id, "file_path": j.file_path, "error": str(cleanup_err)})
-
     except Exception as e:
         get_logger("ingest").exception("ingest_job_failed", extra={"job_id": job_id})
         try:
@@ -236,7 +228,11 @@ class MessageCreateRequest(BaseModel):
     content: str
 
 class SessionUpdateRequest(BaseModel):
-    title: str
+    title: Optional[str] = None
+    workspaceId: Optional[str] = None
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str
 
 class ChatMessage(BaseModel):
     role: str
@@ -308,6 +304,8 @@ def to_dict(obj):
         d['userId'] = d.pop('user_id')
     if 'session_id' in d:
         d['sessionId'] = d.pop('session_id')
+    if 'workspace_id' in d:
+        d['workspaceId'] = d.pop('workspace_id')
     if 'parent_job_id' in d:
         d['parentJobId'] = d.pop('parent_job_id')
     if 'file_name' in d:
@@ -532,6 +530,66 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
         get_logger("auth").exception("register_failed", extra={"username": req.username})
         return {"success": False, "message": "Internal Server Error"}
 
+@app.get("/api/workspaces")
+def get_workspaces(userId: str, db: Session = Depends(get_db)):
+    try:
+        set_step("get_workspaces")
+        workspaces = db.query(models.Workspace).filter(models.Workspace.user_id == userId).order_by(desc(models.Workspace.created_at)).all()
+        return {"success": True, "workspaces": [{"id": str(w.id), "name": w.name, "createdAt": w.created_at.isoformat()} for w in workspaces]}
+    except Exception as e:
+        get_logger("workspaces").exception("get_workspaces_failed", extra={"userId": userId})
+        return {"success": False, "message": str(e)}
+
+@app.post("/api/workspaces")
+def create_workspace(userId: str, req: WorkspaceCreateRequest, db: Session = Depends(get_db)):
+    try:
+        set_step("create_workspace")
+        w = models.Workspace(user_id=userId, name=req.name)
+        db.add(w)
+        db.commit()
+        db.refresh(w)
+        return {"success": True, "workspace": {"id": str(w.id), "name": w.name, "createdAt": w.created_at.isoformat()}}
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "message": str(e)}
+
+@app.delete("/api/workspaces/{workspace_id}")
+def delete_workspace(workspace_id: str, userId: str, db: Session = Depends(get_db)):
+    try:
+        set_step("delete_workspace")
+        w = db.query(models.Workspace).filter(models.Workspace.id == workspace_id, models.Workspace.user_id == userId).first()
+        if not w:
+            return {"success": False, "error": "Workspace not found"}
+        db.delete(w)
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "message": str(e)}
+
+@app.put("/api/sessions/{session_id}")
+def update_session(session_id: str, userId: str, req: SessionUpdateRequest, db: Session = Depends(get_db)):
+    try:
+        set_step("update_session")
+        s = db.query(models.Session).filter(models.Session.id == session_id, models.Session.user_id == userId).first()
+        if not s:
+            return {"success": False, "error": "Session not found"}
+        
+        if req.title is not None:
+            s.title = req.title
+            
+        if req.workspaceId is not None:
+            if req.workspaceId == "":
+                s.workspace_id = None
+            else:
+                s.workspace_id = req.workspaceId
+                
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "message": str(e)}
+
 @app.get("/api/sessions")
 def get_sessions(userId: str, db: Session = Depends(get_db)):
     try:
@@ -619,6 +677,14 @@ def create_feedback(req: FeedbackCreateRequest, db: Session = Depends(get_db)):
         db.add(fb)
         db.commit()
         kind = str(req.kind or "thumbs")
+        
+        # Nếu gửi feedback, xoá cache (cả positive/negative) cho tin nhắn này trước khi xử lý lại
+        try:
+            db.query(models.CachedAnswer).filter(models.CachedAnswer.message_id == req.messageId).delete(synchronize_session=False)
+            db.commit()
+        except Exception as e:
+            pass
+
         if kind == "thumbs" and int(req.value or 0) == 1:
             cached_id = None
             if isinstance(req.metadata, dict):
@@ -685,20 +751,10 @@ def create_feedback(req: FeedbackCreateRequest, db: Session = Depends(get_db)):
                                 db.add(ca)
                             db.commit()
         if kind == "thumbs" and int(req.value or 0) == -1:
-            cached_id = None
-            if isinstance(req.metadata, dict):
-                cached_id = req.metadata.get("cachedAnswerId") or req.metadata.get("cacheId")
-            if cached_id:
-                cid = None
-                try:
-                    cid = uuid.UUID(str(cached_id))
-                except Exception:
-                    cid = str(cached_id)
-                db.query(models.CachedAnswer).filter(models.CachedAnswer.id == cid).delete(synchronize_session=False)
-                db.commit()
-            else:
-                db.query(models.CachedAnswer).filter(models.CachedAnswer.message_id == req.messageId).delete(synchronize_session=False)
-                db.commit()
+            pass # Cache đã xoá ở trên
+        elif kind in ["citation_not_relevant", "hallucination_report"] or req.value == 2:
+            pass # Report cũng tự động xoá cache ở trên
+            
         return {"success": True}
     except Exception as e:
         db.rollback()
@@ -929,16 +985,6 @@ def delete_session(session_id: str, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         return {"success": False, "message": str(e)}
-
-@app.put("/api/sessions/{session_id}")
-def update_session(session_id: str, req: SessionUpdateRequest, db: Session = Depends(get_db)):
-    session = db.query(models.Session).filter(models.Session.id == session_id).first()
-    if session:
-        session.title = req.title
-        db.commit()
-        db.refresh(session)
-        return {"success": True, "session": to_dict(session)}
-    raise HTTPException(status_code=404, detail="Session not found")
 
 @app.get("/api/admin/users")
 def get_admin_users(db: Session = Depends(get_db)):

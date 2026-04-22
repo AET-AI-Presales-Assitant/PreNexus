@@ -1,7 +1,20 @@
 import { useQuery } from '@tanstack/react-query';
-import { Session, User, AnalyticsQuery } from '../types';
+import { Session, User, AnalyticsQuery, Workspace } from '../types';
 
 import { apiUrl } from '../lib/api';
+
+export const useWorkspaces = (userId: string | undefined) => {
+  return useQuery({
+    queryKey: ['workspaces', userId],
+    queryFn: async () => {
+      if (!userId) return [];
+      const response = await fetch(apiUrl(`/workspaces?userId=${userId}`));
+      const data = await response.json();
+      return data.workspaces as Workspace[];
+    },
+    enabled: !!userId,
+  });
+};
 
 export const useSessions = (userId: string | undefined) => {
   return useQuery({
